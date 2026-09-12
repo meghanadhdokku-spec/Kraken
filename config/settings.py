@@ -118,3 +118,7 @@ XVIEW3_CLASS_NAMES = ["non_vessel", "vessel", "fishing_vessel"]
 # xView3 confidence tiers to include in training labels
 # "HIGH" only = cleanest labels; add "MEDIUM" for more data
 XVIEW3_MIN_CONFIDENCE = "LOW"    # include all: HIGH, MEDIUM, LOW
+
+# ── AIS dark vessel matching ──────────────────────────────────────────────────
+GFW_API_TOKEN      = os.getenv("GFW_API_TOKEN", "")   # Global Fishing Watch API token
+AIS_MATCH_RADIUS_KM = 1.0                             # km — detection ↔ AIS match radius
