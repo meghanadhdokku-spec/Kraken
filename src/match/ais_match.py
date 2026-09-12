@@ -79,7 +79,7 @@ def _fetch_from_gfw(
     end_time: str,
     api_token: str,
 ) -> list[dict]:
-    """Query the Global Fishing Watch v3 events API."""
+    """Query the Global Fishing Watch v3 API for all vessel types."""
     try:
         import requests  # type: ignore
     except ImportError:
@@ -87,51 +87,66 @@ def _fetch_from_gfw(
         return []
 
     west, south, east, north = bbox
-    url = "https://gateway.api.globalfishingwatch.org/v3/events"
-    params = {
-        "datasets[0]": "public-global-fishing-events:latest",
-        "start-date": start_time,
-        "end-date": end_time,
-        "bbox": f"{west},{south},{east},{north}",
-        "limit": 500,
-        "offset": 0,
-    }
     headers = {
         "Authorization": f"Bearer {api_token}",
         "Content-Type": "application/json",
     }
 
     vessels: list[dict] = []
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
 
-        # GFW v3 events response shape: {"entries": [...], "total": N, ...}
-        entries = data if isinstance(data, list) else data.get("entries", [])
+    # Query both fishing events and all-vessel presence to cover every type
+    # (fishing vessels, cargo, tankers, passenger, etc.)
+    _datasets = [
+        ("public-global-fishing-events:latest",  "events"),
+        ("public-global-presence:latest",         "presence"),
+    ]
 
-        for entry in entries:
-            pos = entry.get("position", {})
-            lat = pos.get("lat") or entry.get("lat")
-            lon = pos.get("lon") or entry.get("lon")
-            if lat is None or lon is None:
+    for dataset, kind in _datasets:
+        url = "https://gateway.api.globalfishingwatch.org/v3/events"
+        params = {
+            "datasets[0]": dataset,
+            "start-date": start_time,
+            "end-date": end_time,
+            "bbox": f"{west},{south},{east},{north}",
+            "limit": 500,
+            "offset": 0,
+        }
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 422:
+                # Dataset not supported on this endpoint — skip silently
+                log.debug("GFW dataset %s not available on events endpoint.", dataset)
                 continue
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data if isinstance(data, list) else data.get("entries", [])
 
-            vessel_info = entry.get("vessel", {})
-            vessels.append({
-                "lat": float(lat),
-                "lon": float(lon),
-                "vessel_id": vessel_info.get("id") or entry.get("vessel_id", ""),
-                "vessel_name": vessel_info.get("name") or entry.get("vessel_name", ""),
-                "flag": vessel_info.get("flag") or entry.get("flag", ""),
-                "timestamp": entry.get("start", entry.get("timestamp", "")),
-            })
+            seen = {v["vessel_id"] for v in vessels}
+            for entry in entries:
+                pos = entry.get("position", {})
+                lat = pos.get("lat") or entry.get("lat")
+                lon = pos.get("lon") or entry.get("lon")
+                if lat is None or lon is None:
+                    continue
+                vessel_info = entry.get("vessel", {})
+                vid = vessel_info.get("id") or entry.get("vessel_id", "")
+                if vid and vid in seen:
+                    continue  # deduplicate across dataset queries
+                seen.add(vid)
+                vessels.append({
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "vessel_id": vid,
+                    "vessel_name": vessel_info.get("name") or entry.get("vessel_name", ""),
+                    "flag": vessel_info.get("flag") or entry.get("flag", ""),
+                    "timestamp": entry.get("start", entry.get("timestamp", "")),
+                })
+            log.info("GFW %s dataset returned %d entries.", kind, len(entries))
 
-        log.info("GFW API returned %d vessel events.", len(vessels))
+        except Exception as exc:
+            log.warning("GFW %s query failed (%s) — skipping.", kind, exc)
 
-    except Exception as exc:
-        log.warning("GFW API request failed (%s) — returning empty vessel list.", exc)
-
+    log.info("GFW API total unique vessels: %d", len(vessels))
     return vessels
 
 
