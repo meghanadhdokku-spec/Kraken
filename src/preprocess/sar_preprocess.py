@@ -127,14 +127,18 @@ def reproject_to_wgs84(
     Returns reprojected data and updated profile.
     """
     src_crs = meta.get("crs")
-    if src_crs and CRS(src_crs) == TARGET_CRS:
+    if src_crs and CRS(src_crs).to_epsg() == 4326:
         return data, meta
 
     n_bands, src_h, src_w = data.shape
     src_transform = meta["transform"]
 
+    left, bottom, right, top = rasterio.transform.array_bounds(
+        src_h, src_w, src_transform
+    )
     dst_transform, dst_w, dst_h = calculate_default_transform(
-        src_crs, TARGET_CRS, src_w, src_h, transform=src_transform
+        src_crs, TARGET_CRS, src_w, src_h,
+        left=left, bottom=bottom, right=right, top=top,
     )
 
     out = np.full((n_bands, dst_h, dst_w), np.nan, dtype=np.float32)
