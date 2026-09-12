@@ -1,0 +1,7 @@
+# Additional dependencies for YOLO training only.
+# Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements_train.txt
+torch>=2.2.0
+torchvision>=0.17.0
+ultralytics>=8.2.0
+sentinelsat>=1.3.0

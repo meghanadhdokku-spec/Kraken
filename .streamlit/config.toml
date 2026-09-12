@@ -1,0 +1,13 @@
+[theme]
+base            = "dark"
+primaryColor    = "#00D4FF"
+backgroundColor = "#0A0F1A"
+secondaryBackgroundColor = "#111827"
+textColor       = "#E2E8F0"
+
+[server]
+maxUploadSize = 500   # MB — large SAR GeoTIFFs
+headless      = true
+
+[browser]
+gatherUsageStats = false

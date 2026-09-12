@@ -3,8 +3,8 @@ Kraken — Vessel Detection Web UI
 Run with:  streamlit run app.py
 """
 
-import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -13,6 +13,11 @@ import folium
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+# Inject Streamlit Cloud secrets into env before config.settings loads
+for _key in ("COPERNICUS_USER", "COPERNICUS_PASSWORD", "GFW_API_TOKEN"):
+    if _key in st.secrets:
+        os.environ[_key] = st.secrets[_key]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.detect.cfar_detect import detect_scene
