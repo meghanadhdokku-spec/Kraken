@@ -79,7 +79,11 @@ def _fetch_from_gfw(
     end_time: str,
     api_token: str,
 ) -> list[dict]:
-    """Query the Global Fishing Watch v3 API for all vessel types."""
+    """
+    Query GFW for all vessel types:
+    1. Events API  — fishing vessel events (free tier)
+    2. Vessel search + tracks — all AIS types incl. cargo/tankers
+    """
     try:
         import requests  # type: ignore
     except ImportError:
@@ -87,64 +91,110 @@ def _fetch_from_gfw(
         return []
 
     west, south, east, north = bbox
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
     vessels: list[dict] = []
+    seen: set[str] = set()
 
-    # Query both fishing events and all-vessel presence to cover every type
-    # (fishing vessels, cargo, tankers, passenger, etc.)
-    _datasets = [
-        ("public-global-fishing-events:latest",  "events"),
-        ("public-global-presence:latest",         "presence"),
-    ]
-
-    for dataset, kind in _datasets:
-        url = "https://gateway.api.globalfishingwatch.org/v3/events"
-        params = {
-            "datasets[0]": dataset,
-            "start-date": start_time,
-            "end-date": end_time,
-            "bbox": f"{west},{south},{east},{north}",
-            "limit": 500,
-            "offset": 0,
-        }
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code == 422:
-                # Dataset not supported on this endpoint — skip silently
-                log.debug("GFW dataset %s not available on events endpoint.", dataset)
+    # ── 1. Fishing events (GFW primary dataset) ───────────────────────────────
+    try:
+        resp = requests.get(
+            "https://gateway.api.globalfishingwatch.org/v3/events",
+            params={
+                "datasets[0]": "public-global-fishing-events:latest",
+                "start-date": start_time,
+                "end-date": end_time,
+                "bbox": f"{west},{south},{east},{north}",
+                "limit": 500,
+            },
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        entries = resp.json().get("entries", [])
+        for entry in entries:
+            pos = entry.get("position", {})
+            lat = pos.get("lat") or entry.get("lat")
+            lon = pos.get("lon") or entry.get("lon")
+            if lat is None or lon is None:
                 continue
-            resp.raise_for_status()
-            data = resp.json()
-            entries = data if isinstance(data, list) else data.get("entries", [])
+            vessel_info = entry.get("vessel", {})
+            vid = vessel_info.get("id") or entry.get("vessel_id", "")
+            if vid in seen:
+                continue
+            seen.add(vid)
+            vessels.append({
+                "lat": float(lat), "lon": float(lon),
+                "vessel_id": vid,
+                "vessel_name": vessel_info.get("name") or "",
+                "flag": vessel_info.get("flag") or "",
+                "timestamp": entry.get("start", ""),
+            })
+        log.info("GFW fishing events: %d vessels", len(vessels))
+    except Exception as exc:
+        log.warning("GFW fishing events failed (%s)", exc)
 
-            seen = {v["vessel_id"] for v in vessels}
-            for entry in entries:
-                pos = entry.get("position", {})
-                lat = pos.get("lat") or entry.get("lat")
-                lon = pos.get("lon") or entry.get("lon")
-                if lat is None or lon is None:
+    # ── 2. Vessel search → tracks (covers cargo, tankers, all AIS types) ──────
+    try:
+        search_resp = requests.post(
+            "https://gateway.api.globalfishingwatch.org/v3/vessels/search",
+            headers=headers,
+            json={
+                "datasets": ["public-global-vessel-identity:latest"],
+                "where": (
+                    f"lastTransmissionDate >= '{start_time[:10]}' "
+                    f"AND lastTransmissionDate <= '{end_time[:10]}'"
+                ),
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [west, south], [east, south],
+                        [east, north], [west, north], [west, south],
+                    ]],
+                },
+                "limit": 100,
+            },
+            timeout=20,
+        )
+        if search_resp.status_code in (200, 201):
+            vessel_ids = [
+                e.get("id") for e in search_resp.json().get("entries", [])
+                if e.get("id") and e.get("id") not in seen
+            ]
+            for vid in vessel_ids[:50]:  # cap to avoid rate limits
+                try:
+                    track_resp = requests.get(
+                        f"https://gateway.api.globalfishingwatch.org/v3/vessels/{vid}/tracks",
+                        headers=headers,
+                        params={
+                            "startDate": start_time,
+                            "endDate": end_time,
+                            "datasets[0]": "public-global-fishing-tracks:latest",
+                        },
+                        timeout=10,
+                    )
+                    if track_resp.status_code != 200:
+                        continue
+                    coords = track_resp.json().get("features", [{}])[0].get(
+                        "geometry", {}
+                    ).get("coordinates", [])
+                    if not coords:
+                        continue
+                    mid = coords[len(coords) // 2]
+                    seen.add(vid)
+                    vessels.append({
+                        "lat": float(mid[1]), "lon": float(mid[0]),
+                        "vessel_id": vid,
+                        "vessel_name": "",
+                        "flag": "",
+                        "timestamp": start_time,
+                    })
+                except Exception:
                     continue
-                vessel_info = entry.get("vessel", {})
-                vid = vessel_info.get("id") or entry.get("vessel_id", "")
-                if vid and vid in seen:
-                    continue  # deduplicate across dataset queries
-                seen.add(vid)
-                vessels.append({
-                    "lat": float(lat),
-                    "lon": float(lon),
-                    "vessel_id": vid,
-                    "vessel_name": vessel_info.get("name") or entry.get("vessel_name", ""),
-                    "flag": vessel_info.get("flag") or entry.get("flag", ""),
-                    "timestamp": entry.get("start", entry.get("timestamp", "")),
-                })
-            log.info("GFW %s dataset returned %d entries.", kind, len(entries))
-
-        except Exception as exc:
-            log.warning("GFW %s query failed (%s) — skipping.", kind, exc)
+            log.info("GFW vessel tracks added %d extra vessels", len(vessel_ids))
+        else:
+            log.debug("GFW vessel search returned %d", search_resp.status_code)
+    except Exception as exc:
+        log.warning("GFW vessel search/tracks failed (%s)", exc)
 
     log.info("GFW API total unique vessels: %d", len(vessels))
     return vessels
