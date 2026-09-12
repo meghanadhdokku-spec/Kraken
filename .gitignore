@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Kraken project
+.env
+data/raw/*.zip
+data/raw/*.SAFE/
+data/processed/*.tif
+models/*.pt
+outputs/
