@@ -45,6 +45,7 @@ from config.settings import (
     CFAR_BACKGROUND_CELLS,
     CFAR_FALSE_ALARM_RATE,
 )
+from src.utils.geo_utils import detections_to_geojson, save_geojson
 
 
 # ── threshold maths ────────────────────────────────────────────────────────────
@@ -286,6 +287,9 @@ def detect_scene(
     stem = scene_path.stem
     save_mask(raw_mask, scene_path, out_dir / f"{stem}_cfar_mask.tif")
     save_detections_csv(boxes, out_dir / f"{stem}_cfar_detections.csv")
+
+    geojson = detections_to_geojson(boxes, stem, detector="cfar")
+    save_geojson(geojson, out_dir / f"{stem}_cfar_detections.geojson")
 
     print(f"  Final vessel candidates: {len(boxes)}")
     return boxes

@@ -26,6 +26,7 @@ from config.settings import (
     YOLO_IOU_THRESH,
     YOLO_PRETRAINED,
 )
+from src.utils.geo_utils import detections_to_geojson, save_geojson
 
 
 # ── tiling helpers ─────────────────────────────────────────────────────────────
@@ -102,6 +103,34 @@ def stitch_detections(
     return all_boxes
 
 
+def _iou_xyxy(a: dict, b: dict) -> float:
+    ix1 = max(a["x1"], b["x1"]); iy1 = max(a["y1"], b["y1"])
+    ix2 = min(a["x2"], b["x2"]); iy2 = min(a["y2"], b["y2"])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+    area_b = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+    return inter / (area_a + area_b - inter)
+
+
+def nms_yolo(boxes: list[dict], iou_threshold: float = 0.5) -> list[dict]:
+    """Greedy NMS on xyxy boxes; keeps highest-conf box per overlap cluster."""
+    if not boxes:
+        return []
+    sorted_boxes = sorted(boxes, key=lambda b: b["conf"], reverse=True)
+    kept = []
+    suppressed = set()
+    for i, box in enumerate(sorted_boxes):
+        if i in suppressed:
+            continue
+        kept.append(box)
+        for j in range(i + 1, len(sorted_boxes)):
+            if j not in suppressed and _iou_xyxy(box, sorted_boxes[j]) > iou_threshold:
+                suppressed.add(j)
+    return kept
+
+
 # ── inference ─────────────────────────────────────────────────────────────────
 
 def run_yolo_on_scene(
@@ -142,14 +171,22 @@ def run_yolo_on_scene(
     boxes = stitch_detections(tile_results, transform)
     print(f"[INFO] {len(boxes)} detection(s) after stitching.")
 
+    boxes = nms_yolo(boxes, iou_threshold=iou)
+    print(f"[INFO] {len(boxes)} detection(s) after NMS.")
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_txt = out_dir / f"{scene_path.stem}_yolo_detections.txt"
+    stem = scene_path.stem
+    out_txt = out_dir / f"{stem}_yolo_detections.csv"
     with open(out_txt, "w") as f:
         f.write("lon,lat,conf,cls,x1,y1,x2,y2\n")
         for b in boxes:
             f.write(f"{b['lon']:.6f},{b['lat']:.6f},{b['conf']:.4f},{b['cls']},"
                     f"{b['x1']:.1f},{b['y1']:.1f},{b['x2']:.1f},{b['y2']:.1f}\n")
-    print(f"[OK]   Detections → {out_txt}")
+    print(f"[OK]   CSV        → {out_txt}")
+
+    geojson = detections_to_geojson(boxes, stem, detector="yolo")
+    save_geojson(geojson, out_dir / f"{stem}_yolo_detections.geojson")
+
     return boxes
 
 

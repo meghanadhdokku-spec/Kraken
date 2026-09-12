@@ -1,5 +1,5 @@
 """
-End-to-end Kraken pipeline: download → preprocess → CFAR detect.
+End-to-end Kraken pipeline: download → preprocess → detect → visualise.
 
 Usage:
     # Full run (requires Copernicus credentials in .env):
@@ -11,6 +11,17 @@ Usage:
     # Skip both download and preprocess (detect on existing GeoTIFF):
     python -m src.pipeline --skip-download --skip-preprocess \
         --scene data/processed/S1A_..._processed.tif
+
+    # YOLO only (requires trained weights):
+    python -m src.pipeline --skip-download --skip-preprocess \
+        --scene data/processed/scene.tif \
+        --detector yolo --weights models/yolo_vessel/weights/best.pt
+
+    # Both detectors + visualisation:
+    python -m src.pipeline --skip-download --skip-preprocess \
+        --scene data/processed/scene.tif \
+        --detector both --weights models/yolo_vessel/weights/best.pt \
+        --viz
 """
 
 import argparse
@@ -26,6 +37,9 @@ from config.settings import (
     CFAR_GUARD_CELLS,
     CFAR_BACKGROUND_CELLS,
     CFAR_FALSE_ALARM_RATE,
+    YOLO_CONF_THRESH,
+    YOLO_IOU_THRESH,
+    YOLO_IMG_SIZE,
 )
 from src.download.sentinel_download import (
     build_api,
@@ -38,7 +52,8 @@ from src.download.sentinel_download import (
     SENTINEL_API_URL,
 )
 from src.preprocess.sar_preprocess import preprocess_scene
-from src.detect.cfar_detect import detect_scene
+from src.detect.cfar_detect import detect_scene as cfar_detect_scene
+from src.utils.geo_utils import merge_geojson, detections_to_geojson, save_geojson
 
 
 def run_pipeline(
@@ -54,9 +69,16 @@ def run_pipeline(
     cfar_guard: int       = CFAR_GUARD_CELLS,
     cfar_bg: int          = CFAR_BACKGROUND_CELLS,
     pfa: float            = CFAR_FALSE_ALARM_RATE,
+    detector: str         = "cfar",
+    weights: Path | None  = None,
+    yolo_conf: float      = YOLO_CONF_THRESH,
+    yolo_iou: float       = YOLO_IOU_THRESH,
+    yolo_tile: int        = YOLO_IMG_SIZE,
+    viz: bool             = False,
 ) -> list[dict]:
     """
     Orchestrate the full pipeline and return all detections across scenes.
+    detector: 'cfar' | 'yolo' | 'both'
     """
     all_detections = []
 
@@ -67,7 +89,6 @@ def run_pipeline(
         else:
             raw_scenes = [scene] if scene.suffix.lower() in (".zip", "") else []
             if not raw_scenes:
-                # treat as already-preprocessed
                 raw_scenes = []
     else:
         if not COPERNICUS_USER or not COPERNICUS_PASSWORD:
@@ -98,7 +119,6 @@ def run_pipeline(
 
     # ── 2. Preprocess ──────────────────────────────────────────────────────────
     if skip_preprocess:
-        # scene is assumed to already be a processed GeoTIFF
         if scene is not None:
             processed_scenes = [scene]
         else:
@@ -118,17 +138,66 @@ def run_pipeline(
 
     # ── 3. Detect ──────────────────────────────────────────────────────────────
     for tif in processed_scenes:
-        try:
-            boxes = detect_scene(
-                tif,
-                guard=cfar_guard,
-                background=cfar_bg,
-                pfa=pfa,
-                out_dir=out_dir,
-            )
-            all_detections.extend(boxes)
-        except Exception as exc:
-            print(f"[WARN] CFAR failed for {tif.name}: {exc}")
+        stem = tif.stem
+        cfar_boxes: list[dict] = []
+        yolo_boxes: list[dict] = []
+
+        if detector in ("cfar", "both"):
+            try:
+                cfar_boxes = cfar_detect_scene(
+                    tif,
+                    guard=cfar_guard,
+                    background=cfar_bg,
+                    pfa=pfa,
+                    out_dir=out_dir,
+                )
+                all_detections.extend(cfar_boxes)
+            except Exception as exc:
+                print(f"[WARN] CFAR failed for {tif.name}: {exc}")
+
+        if detector in ("yolo", "both"):
+            if weights is None:
+                print("[WARN] --weights required for YOLO detector; skipping.")
+            else:
+                try:
+                    from src.detect.yolo_detect import run_yolo_on_scene
+                    yolo_boxes = run_yolo_on_scene(
+                        tif, weights,
+                        tile_size=yolo_tile,
+                        conf=yolo_conf,
+                        iou=yolo_iou,
+                        out_dir=out_dir,
+                    )
+                    all_detections.extend(yolo_boxes)
+                except Exception as exc:
+                    print(f"[WARN] YOLO failed for {tif.name}: {exc}")
+
+        # ── combined GeoJSON when both detectors ran ───────────────────────────
+        if detector == "both" and (cfar_boxes or yolo_boxes):
+            cfar_fc = detections_to_geojson(cfar_boxes, stem, "cfar")
+            yolo_fc = detections_to_geojson(yolo_boxes, stem, "yolo")
+            combined = merge_geojson(cfar_fc, yolo_fc)
+            save_geojson(combined, out_dir / f"{stem}_detections.geojson")
+
+        # ── visualisation ──────────────────────────────────────────────────────
+        if viz:
+            try:
+                from src.utils.viz import render_scene_overview, render_detection_grid
+                render_scene_overview(
+                    tif,
+                    cfar_boxes=cfar_boxes or None,
+                    yolo_boxes=yolo_boxes or None,
+                    out_path=out_dir / f"{stem}_overview.png",
+                )
+                all_boxes = cfar_boxes + yolo_boxes
+                if all_boxes:
+                    render_detection_grid(
+                        tif,
+                        all_boxes,
+                        out_path=out_dir / f"{stem}_chips.png",
+                    )
+            except Exception as exc:
+                print(f"[WARN] Visualisation failed for {tif.name}: {exc}")
 
     print(f"\n[PIPELINE DONE] Total vessel candidates: {len(all_detections)}")
     return all_detections
@@ -154,6 +223,16 @@ def parse_args(argv=None):
     p.add_argument("--guard",            type=int,   default=CFAR_GUARD_CELLS)
     p.add_argument("--background",       type=int,   default=CFAR_BACKGROUND_CELLS)
     p.add_argument("--pfa",              type=float, default=CFAR_FALSE_ALARM_RATE)
+    p.add_argument("--detector",         default="cfar",
+                   choices=["cfar", "yolo", "both"],
+                   help="Which detector(s) to run")
+    p.add_argument("--weights",          type=Path,  default=None,
+                   help="YOLO weights .pt file (required for yolo/both)")
+    p.add_argument("--yolo-conf",        type=float, default=YOLO_CONF_THRESH)
+    p.add_argument("--yolo-iou",         type=float, default=YOLO_IOU_THRESH)
+    p.add_argument("--yolo-tile",        type=int,   default=YOLO_IMG_SIZE)
+    p.add_argument("--viz",              action="store_true",
+                   help="Save scene overview and detection chip grid PNGs")
     return p.parse_args(argv)
 
 
@@ -172,6 +251,12 @@ def main(argv=None):
         cfar_guard      = args.guard,
         cfar_bg         = args.background,
         pfa             = args.pfa,
+        detector        = args.detector,
+        weights         = args.weights,
+        yolo_conf       = args.yolo_conf,
+        yolo_iou        = args.yolo_iou,
+        yolo_tile       = args.yolo_tile,
+        viz             = args.viz,
     )
 
 
