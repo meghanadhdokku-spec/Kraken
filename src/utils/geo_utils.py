@@ -55,6 +55,13 @@ def detections_to_geojson(
 
     Accepts both CFAR format (x, y, w, h) and YOLO format (x1, y1, x2, y2).
     Each detection must already have lon/lat fields.
+
+    Optional detection fields propagated to GeoJSON properties when present:
+      conf         : detection confidence score
+      area_px      : component area in pixels
+      length_m     : estimated vessel length in metres
+      width_m      : estimated vessel width in metres
+      vessel_class : coarse vessel type label
     """
     CLASS_NAMES = {0: "non_vessel", 1: "vessel", 2: "fishing_vessel"}
     features = []
@@ -82,6 +89,12 @@ def detections_to_geojson(
             props["conf"] = round(float(det["conf"]), 4)
         if det.get("area_px") is not None:
             props["area_px"] = int(det["area_px"])
+        if det.get("length_m") is not None:
+            props["length_m"] = det["length_m"]
+        if det.get("width_m") is not None:
+            props["width_m"] = det["width_m"]
+        if det.get("vessel_class") is not None:
+            props["vessel_class"] = det["vessel_class"]
 
         features.append({
             "type": "Feature",

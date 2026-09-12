@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -209,6 +210,71 @@ def add_geo_coords(boxes: list[dict], transform) -> list[dict]:
     return boxes
 
 
+def estimate_vessel_dimensions(boxes: list[dict], transform, crs) -> list[dict]:
+    """
+    Estimate physical length, width, and vessel class for each detection.
+
+    Uses pixel spacing derived from the affine transform and converts to metres
+    at the scene's centre latitude.  Adds three fields to every box dict:
+      length_m     : longer physical dimension, rounded to 1 decimal (metres)
+      width_m      : shorter physical dimension, rounded to 1 decimal (metres)
+      vessel_class : coarse type string inferred from length_m
+
+    Vessel-class thresholds (length_m):
+      < 20 m             → "small_craft"
+      20 – 50 m          → "fishing_vessel"
+      50 – 100 m         → "coastal_freighter"
+      100 – 200 m        → "cargo_ship"
+      > 200 m            → "vlcc_or_large"
+
+    Parameters
+    ----------
+    boxes     : Detection dicts that already contain cx, cy, w, h fields.
+    transform : Rasterio affine transform for the scene (EPSG:4326, north-up).
+    crs       : Scene CRS (unused but retained for API consistency / future use).
+    """
+    if not boxes:
+        return boxes
+
+    # Pixel spacing in degrees (transform.a = east step, transform.e = north step)
+    px_deg = abs(transform.a)
+    py_deg = abs(transform.e)
+
+    # Scene centre latitude: convert mean box-centroid row to geographic latitude
+    mean_cy = sum(b["cy"] for b in boxes) / len(boxes)
+    _lon, lat_centre = rtransform.xy(transform, mean_cy, 0.0)
+
+    # Metres per degree at the centre latitude
+    metres_per_deg_lon = 111320.0 * math.cos(math.radians(lat_centre))
+    metres_per_deg_lat = 110540.0
+
+    # Pixel size in metres along each axis
+    px_m = px_deg * metres_per_deg_lon
+    py_m = py_deg * metres_per_deg_lat
+
+    for b in boxes:
+        dim_x = b["w"] * px_m   # east-west extent in metres
+        dim_y = b["h"] * py_m   # north-south extent in metres
+        length_m = round(max(dim_x, dim_y), 1)
+        width_m  = round(min(dim_x, dim_y), 1)
+        b["length_m"] = length_m
+        b["width_m"]  = width_m
+
+        # Coarse vessel-type inference based on length
+        if length_m < 20.0:
+            b["vessel_class"] = "small_craft"
+        elif length_m < 50.0:
+            b["vessel_class"] = "fishing_vessel"
+        elif length_m < 100.0:
+            b["vessel_class"] = "coastal_freighter"
+        elif length_m <= 200.0:
+            b["vessel_class"] = "cargo_ship"
+        else:
+            b["vessel_class"] = "vlcc_or_large"
+
+    return boxes
+
+
 # ── I/O ────────────────────────────────────────────────────────────────────────
 
 def save_mask(
@@ -226,19 +292,28 @@ def save_mask(
 
 def save_detections_csv(boxes: list[dict], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["lon", "lat", "cx_px", "cy_px", "x", "y", "w", "h", "area_px"]
+    fieldnames = [
+        "lon", "lat", "cx_px", "cy_px",
+        "x", "y", "w", "h", "area_px",
+        "length_m", "width_m", "vessel_class",
+    ]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for b in boxes:
             writer.writerow({
-                "lon": f"{b['lon']:.6f}",
-                "lat": f"{b['lat']:.6f}",
-                "cx_px": f"{b['cx']:.1f}",
-                "cy_px": f"{b['cy']:.1f}",
-                "x": b["x"], "y": b["y"],
-                "w": b["w"], "h": b["h"],
-                "area_px": b["area_px"],
+                "lon":          f"{b['lon']:.6f}",
+                "lat":          f"{b['lat']:.6f}",
+                "cx_px":        f"{b['cx']:.1f}",
+                "cy_px":        f"{b['cy']:.1f}",
+                "x":            b["x"],
+                "y":            b["y"],
+                "w":            b["w"],
+                "h":            b["h"],
+                "area_px":      b["area_px"],
+                "length_m":     b.get("length_m", ""),
+                "width_m":      b.get("width_m", ""),
+                "vessel_class": b.get("vessel_class", ""),
             })
     print(f"[OK]   CSV       → {out_path}")
 
@@ -261,7 +336,8 @@ def detect_scene(
     """
     Full CFAR detection pipeline for one preprocessed GeoTIFF.
 
-    Returns a list of detection dicts with pixel + geo coordinates.
+    Returns a list of detection dicts with pixel + geo coordinates,
+    physical dimensions (length_m, width_m), and a vessel_class label.
     """
     print(f"\n[CFAR] {scene_path.name}  (band {band_index})")
 
@@ -287,6 +363,7 @@ def detect_scene(
     print(f"  After NMS:               {len(boxes)}")
 
     boxes = add_geo_coords(boxes, transform)
+    boxes = estimate_vessel_dimensions(boxes, transform, crs)
 
     # Save outputs
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -341,10 +418,13 @@ def main(argv=None):
         out_dir        = args.out_dir,
     )
     if boxes:
-        print(f"\n{'LON':>10}  {'LAT':>9}  {'AREA_PX':>8}")
-        print("-" * 32)
+        print(f"\n{'LON':>10}  {'LAT':>9}  {'AREA_PX':>8}  {'LENGTH_M':>10}  {'CLASS'}")
+        print("-" * 60)
         for b in boxes:
-            print(f"  {b['lon']:8.4f}  {b['lat']:8.4f}  {b['area_px']:>8}")
+            print(
+                f"  {b['lon']:8.4f}  {b['lat']:8.4f}  {b['area_px']:>8}"
+                f"  {b.get('length_m', ''):>10}  {b.get('vessel_class', '')}"
+            )
 
 
 if __name__ == "__main__":
