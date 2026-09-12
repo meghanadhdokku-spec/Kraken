@@ -54,6 +54,7 @@ DATA_DIR        = ROOT / "data"
 RAW_DIR         = DATA_DIR / "raw"
 PROCESSED_DIR   = DATA_DIR / "processed"
 ANNOTATIONS_DIR = DATA_DIR / "annotations"
+AIS_DIR         = DATA_DIR / "ais"
 
 # ── Output / model dirs ───────────────────────────────────────────────────────
 MODELS_DIR  = ROOT / "models"

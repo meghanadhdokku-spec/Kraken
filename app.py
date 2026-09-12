@@ -22,7 +22,7 @@ for _key in ("COPERNICUS_USER", "COPERNICUS_PASSWORD", "GFW_API_TOKEN"):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.detect.cfar_detect import detect_scene
 from src.match.ais_match import run_ais_matching
-from config.settings import PROCESSED_DIR, OUTPUTS_DIR, CFAR_FALSE_ALARM_RATE
+from config.settings import PROCESSED_DIR, OUTPUTS_DIR, CFAR_FALSE_ALARM_RATE, AIS_DIR
 
 # ── page config ────────────────────────────────────────────────────────────────
 
@@ -64,6 +64,12 @@ def _pfa_label(exp: int) -> str:
 def _list_processed_scenes() -> list[str]:
     tifs = sorted(PROCESSED_DIR.glob("*_processed.tif"))
     return [t.name for t in tifs]
+
+
+@st.cache_data(show_spinner=False)
+def _list_ais_files() -> list[str]:
+    AIS_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(f.name for f in AIS_DIR.glob("*.csv"))
 
 
 def _build_map(detections: list[dict], center_lat: float, center_lon: float) -> folium.Map:
@@ -192,11 +198,35 @@ with st.sidebar:
 
     # ── AIS matching ───────────────────────────────────────────────────────────
     st.markdown("#### AIS Matching")
-    ais_file = st.file_uploader(
-        "AIS CSV (optional)",
-        type=["csv"],
-        help="Columns: lat, lon, mmsi, vessel_name, flag, timestamp",
+
+    local_ais = _list_ais_files()
+    ais_source = st.radio(
+        "AIS source",
+        ["Local file (data/ais/)", "Upload CSV"],
+        label_visibility="collapsed",
     )
+
+    ais_file = None
+    selected_ais_name = None
+
+    if ais_source == "Upload CSV":
+        ais_file = st.file_uploader(
+            "AIS CSV",
+            type=["csv"],
+            help="Columns: lat, lon, mmsi, vessel_name, flag, timestamp",
+        )
+    else:
+        if local_ais:
+            selected_ais_name = st.selectbox("AIS file", local_ais)
+            st.caption(f"Drop CSVs into `data/ais/` — auto-loaded each run.")
+        else:
+            st.info("No CSVs in `data/ais/` yet.\nDrop a file there or upload below.")
+            ais_file = st.file_uploader(
+                "AIS CSV (fallback)",
+                type=["csv"],
+                help="Columns: lat, lon, mmsi, vessel_name, flag, timestamp",
+            )
+
     ais_radius = st.slider("Match radius (km)", 0.5, 10.0, 2.0, 0.5)
 
     st.divider()
@@ -240,6 +270,8 @@ if run_btn:
         tmp_ais.write(ais_file.read())
         tmp_ais.flush()
         ais_csv_path = Path(tmp_ais.name)
+    elif selected_ais_name:
+        ais_csv_path = AIS_DIR / selected_ais_name
 
     with st.spinner("Running CFAR detection…"):
         try:
