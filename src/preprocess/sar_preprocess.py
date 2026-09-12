@@ -6,12 +6,13 @@ Steps applied per SAFE scene (zip or directory):
   2. Convert DN → σ⁰ linear → dB  (GRD calibration)
   3. Reproject to EPSG:4326 if not already geographic
   4. Clip to AOI bounding box (optional)
-  5. Apply Lee speckle filter
+  5. Apply speckle filter (Lee or Gamma MAP)
   6. Write 2-band float32 GeoTIFF → data/processed/
 
 Usage:
     python -m src.preprocess.sar_preprocess \
-        --scene data/raw/S1A_IW_GRDH_1SDV_...SAFE.zip
+        --scene data/raw/S1A_IW_GRDH_1SDV_...SAFE.zip \
+        --filter gamma
 """
 
 import argparse
@@ -90,7 +91,7 @@ def dn_to_sigma0_db(dn: np.ndarray, nodata: float = 0.0) -> np.ndarray:
     return sigma_db.astype(np.float32)
 
 
-# ── speckle filter ─────────────────────────────────────────────────────────────
+# ── speckle filters ────────────────────────────────────────────────────────────
 
 def lee_filter(img: np.ndarray, kernel_size: int = 7) -> np.ndarray:
     """
@@ -107,6 +108,52 @@ def lee_filter(img: np.ndarray, kernel_size: int = 7) -> np.ndarray:
         # estimate noise variance as the mean of local variances
         noise_var  = float(np.nanmean(local_var))
         weight     = local_var / (local_var + noise_var + 1e-10)
+        filtered   = local_mean + weight * (filled - local_mean)
+        return np.where(nan_mask, np.nan, filtered).astype(np.float32)
+
+    if img.ndim == 2:
+        return _filter_2d(img)
+    return np.stack([_filter_2d(img[b]) for b in range(img.shape[0])])
+
+
+def gamma_map_filter(img: np.ndarray, kernel_size: int = 7) -> np.ndarray:
+    """
+    Gamma MAP speckle filter operating in dB domain.
+
+    Compared to the Lee filter, Gamma MAP uses the local coefficient of
+    variation more accurately, which better preserves point targets (vessels)
+    while still smoothing distributed clutter.
+
+    Algorithm (per band):
+      μ   = local mean  (uniform_filter)
+      σ²  = local variance
+      Cv  = σ / (μ + ε)           coefficient of variation of signal
+      ENL = 1 / mean(Cv²)         scene-level equivalent number of looks
+      w   = Cv² / (Cv² + 1/ENL)   Gamma MAP weight
+      out = μ + w · (img − μ)
+
+    Handles NaN (no-data) pixels by masking before filtering.
+    Works on (bands, H, W) or (H, W).
+    """
+    def _filter_2d(band: np.ndarray) -> np.ndarray:
+        nan_mask   = np.isnan(band)
+        filled     = np.where(nan_mask, 0.0, band)
+
+        local_mean = uniform_filter(filled, kernel_size, mode="reflect")
+        local_sq   = uniform_filter(filled ** 2, kernel_size, mode="reflect")
+        local_var  = np.maximum(local_sq - local_mean ** 2, 0.0)
+
+        # Coefficient of variation of the signal
+        cv         = np.sqrt(local_var) / (local_mean + 1e-10)
+        cv2        = cv ** 2
+
+        # Scene-level ENL estimated from valid (non-NaN) pixels only
+        valid_cv2  = cv2[~nan_mask]
+        enl        = 1.0 / (float(np.nanmean(valid_cv2)) + 1e-10) if valid_cv2.size else 1.0
+
+        # Gamma MAP adaptive weight
+        weight     = cv2 / (cv2 + 1.0 / enl + 1e-10)
+
         filtered   = local_mean + weight * (filled - local_mean)
         return np.where(nan_mask, np.nan, filtered).astype(np.float32)
 
@@ -293,9 +340,16 @@ def preprocess_scene(
     clip_bbox: tuple | None = GOG_BBOX,
     speckle_kernel: int = 7,
     reproject: bool = True,
+    speckle_filter: str = "lee",
 ) -> Path:
     """
     Full preprocessing pipeline for one Sentinel-1 GRD SAFE scene.
+
+    Parameters
+    ----------
+    speckle_filter : ``"lee"`` (default) or ``"gamma"``
+        Speckle filter to apply after clipping.  ``"gamma"`` selects the
+        Gamma MAP filter which better preserves point targets (vessels).
 
     Returns path to the output GeoTIFF.
     """
@@ -312,8 +366,12 @@ def preprocess_scene(
         data, meta = clip_to_bbox(data, meta, clip_bbox)
         print(f"  Clipped to AOI  shape={data.shape}")
 
-    data = lee_filter(data, speckle_kernel)
-    print(f"  Lee filter (kernel={speckle_kernel}) applied")
+    if speckle_filter == "gamma":
+        data = gamma_map_filter(data, speckle_kernel)
+        print(f"  Gamma MAP filter (kernel={speckle_kernel}) applied")
+    else:
+        data = lee_filter(data, speckle_kernel)
+        print(f"  Lee filter (kernel={speckle_kernel}) applied")
 
     stem     = scene_path.stem.split(".")[0]
     out_path = out_dir / f"{stem}_processed.tif"
@@ -333,7 +391,10 @@ def parse_args(argv=None):
     p.add_argument("--out-dir",  type=Path, default=PROCESSED_DIR)
     p.add_argument("--no-clip",  action="store_true", help="Skip AOI clip")
     p.add_argument("--no-reproject", action="store_true", help="Skip reprojection")
-    p.add_argument("--kernel",   type=int, default=7, help="Lee filter kernel size")
+    p.add_argument("--kernel",   type=int, default=7,
+                   help="Speckle filter kernel size")
+    p.add_argument("--filter",   choices=["lee", "gamma"], default="lee",
+                   help="Speckle filter: 'lee' (default) or 'gamma' (Gamma MAP)")
     return p.parse_args(argv)
 
 
@@ -343,6 +404,7 @@ def main(argv=None):
     preprocess_scene(
         args.scene, args.out_dir, clip,
         args.kernel, reproject=not args.no_reproject,
+        speckle_filter=args.filter,
     )
 
 
