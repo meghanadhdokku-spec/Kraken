@@ -413,12 +413,7 @@ def detect_scene(
         raw_mask = apply_land_mask(raw_mask, transform, crs, land_mask_path)
         print(f"  After land mask:         {int(raw_mask.sum())}")
 
-<<<<<<< HEAD
     boxes = filter_detections(raw_mask, min_area_px, max_area_px, linear_image=linear)
-=======
-    boxes = filter_detections(raw_mask, min_area_px, max_area_px,
-                              linear_image=linear)
->>>>>>> origin/main
     print(f"  Connected components:     {len(boxes)}")
 
     boxes = nms_detections(boxes, nms_iou)
