@@ -105,16 +105,30 @@ def cfar_detect(
 def apply_water_mask(
     image_db: np.ndarray,
     mask: np.ndarray,
-    vv_db_threshold: float = -10.0,
+    vv_db_threshold: float = -5.0,
+    min_land_area_px: int = 200,
 ) -> np.ndarray:
     """
-    Suppress detections on pixels whose VV σ⁰ is above a land-threshold.
+    Suppress detections that sit inside extended bright blobs (land/coast).
 
-    Open ocean typically returns −15 to −20 dB VV; land is ≫ −10 dB.
-    This is a coarse heuristic — pair with a proper land mask in production.
+    Strategy: pixels above vv_db_threshold are candidate land. Connected
+    regions of those pixels that are large (≥ min_land_area_px) are treated
+    as land and used to zero CFAR detections. Small bright blobs are left
+    alone so vessel point-targets (which are also bright but compact) survive.
+
+    Typical SAR σ⁰:
+      Open ocean   : −15 to −20 dB
+      Vessels      : −5  to +15 dB  (small, isolated bright target)
+      Land/coast   : −5  to +20 dB  (spatially extended)
     """
-    land = image_db > vv_db_threshold
-    return np.where(land, 0, mask).astype(np.uint8)
+    import cv2
+    bright = (image_db > vv_db_threshold).astype(np.uint8)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+    land_mask = np.zeros_like(bright)
+    for lbl in range(1, len(stats)):
+        if stats[lbl, cv2.CC_STAT_AREA] >= min_land_area_px:
+            land_mask[labels == lbl] = 1
+    return np.where(land_mask, 0, mask).astype(np.uint8)
 
 
 def connected_components(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
