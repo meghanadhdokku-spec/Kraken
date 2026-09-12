@@ -38,3 +38,5 @@ dependencies:
     - geodatasets>=0.2        # Natural Earth land polygons for land mask
     - sentinelsat>=1.3        # kept for any future use; not used in download path
     - ultralytics>=8.2        # pulls torch automatically from PyPI
+    - streamlit>=1.35.0       # web UI
+    - folium>=0.17.0          # interactive maps in Streamlit
