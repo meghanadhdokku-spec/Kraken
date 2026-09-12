@@ -17,7 +17,6 @@ import re
 from datetime import datetime, timezone, timedelta
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +38,8 @@ def fetch_ais_vessels(
     bbox: tuple[float, float, float, float],  # west, south, east, north
     start_time: str,                           # ISO 8601
     end_time: str,                             # ISO 8601
-    api_token: Optional[str] = None,
-    ais_csv_path: Optional[Path] = None,
+    api_token: str | None = None,
+    ais_csv_path: Path | None = None,
 ) -> list[dict]:
     """
     Return AIS vessel positions within *bbox* and the given time window.
@@ -228,7 +227,7 @@ def match_detections_to_ais(
         det_lon = float(det.get("lon", det.get("longitude", 0.0)))
 
         best_dist = float("inf")
-        best_vessel: Optional[dict] = None
+        best_vessel: dict | None = None
 
         for vessel in ais_vessels:
             try:
@@ -289,10 +288,6 @@ def _parse_scene_times(scene_path: Path) -> tuple[str, str]:
     start_raw = m.group("start")   # e.g. 20230412T060000
     stop_raw = m.group("stop")
 
-    def _fmt(raw: str) -> str:
-        dt = datetime.strptime(raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     # Extend window ±30 min to account for vessel movement during pass
     start_dt = datetime.strptime(start_raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
     stop_dt = datetime.strptime(stop_raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
@@ -309,8 +304,8 @@ def run_ais_matching(
     detections: list[dict],
     scene_path: Path,
     radius_km: float = 1.0,
-    api_token: Optional[str] = None,
-    ais_csv_path: Optional[Path] = None,
+    api_token: str | None = None,
+    ais_csv_path: Path | None = None,
 ) -> list[dict]:
     """
     Full AIS matching pipeline for a single SAR scene.
@@ -362,7 +357,7 @@ def run_ais_matching(
     # --- Summary -----------------------------------------------------------------
     n_total = len(annotated)
     n_matched = sum(1 for d in annotated if d.get("ais_match"))
-    n_dark = sum(1 for d in annotated if d.get("dark_vessel"))
+    n_dark = n_total - n_matched
     print(
         f"AIS matching complete: {n_total} detections | "
         f"{n_matched} AIS matches | {n_dark} dark vessels "
