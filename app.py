@@ -198,16 +198,23 @@ with st.sidebar:
     st.markdown("#### AIS Matching")
 
     local_ais = _list_ais_files()
+    _ais_options = []
+    if GFW_API_TOKEN:
+        _ais_options.append("🛰 GFW Live API")
+    _ais_options += ["Local file (data/ais/)", "Upload CSV"]
+
     ais_source = st.radio(
         "AIS source",
-        ["Local file (data/ais/)", "Upload CSV"],
+        _ais_options,
         label_visibility="collapsed",
     )
 
     ais_file = None
     selected_ais_name = None
 
-    if ais_source == "Upload CSV":
+    if ais_source == "🛰 GFW Live API":
+        st.success("Live AIS pulled automatically for each scene's time window.")
+    elif ais_source == "Upload CSV":
         ais_file = st.file_uploader(
             "AIS CSV",
             type=["csv"],
@@ -216,23 +223,19 @@ with st.sidebar:
     else:
         if local_ais:
             selected_ais_name = st.selectbox("AIS file", local_ais)
-            st.caption(f"Drop CSVs into `data/ais/` — auto-loaded each run.")
+            st.caption("Drop CSVs into `data/ais/` — auto-loaded each run.")
         else:
-            st.info("No CSVs in `data/ais/` yet.\nDrop a file there or upload below.")
+            st.info("No CSVs in `data/ais/` yet.")
             ais_file = st.file_uploader(
-                "AIS CSV (fallback)",
+                "AIS CSV",
                 type=["csv"],
                 help="Columns: lat, lon, mmsi, vessel_name, flag, timestamp",
             )
 
-    ais_radius = st.slider("Match radius (km)", 0.5, 10.0, 2.0, 0.5)
-
-    if GFW_API_TOKEN and ais_source == "Local file (data/ais/)" and not local_ais:
-        st.success("🛰 GFW live API active")
-    elif GFW_API_TOKEN and not ais_file and not selected_ais_name:
-        st.success("🛰 GFW live API active")
-    elif not GFW_API_TOKEN and not ais_file and not selected_ais_name:
+    if not GFW_API_TOKEN and not ais_file and not selected_ais_name:
         st.caption("No AIS source — all detections will be dark.")
+
+    ais_radius = st.slider("Match radius (km)", 0.5, 10.0, 2.0, 0.5)
 
     st.divider()
 
