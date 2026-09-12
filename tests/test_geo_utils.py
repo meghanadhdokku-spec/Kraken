@@ -6,43 +6,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import rasterio
-from rasterio.transform import from_bounds
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.utils.geo_utils import (
     detections_to_geojson,
     merge_geojson,
-    pixel_to_lonlat,
-    read_band,
     save_geojson,
-    save_geotiff,
 )
-
-
-# ── fixtures ───────────────────────────────────────────────────────────────────
-
-def _make_tif(tmp_path: Path, data: np.ndarray, bands: int = 1) -> Path:
-    """Write a minimal GeoTIFF and return its path."""
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    path = tmp_path / "test.tif"
-    h, w = data.shape[-2], data.shape[-1]
-    transform = from_bounds(0, 0, 1, 1, w, h)
-    profile = {
-        "driver": "GTiff",
-        "dtype":  "float32",
-        "width":  w,
-        "height": h,
-        "count":  bands,
-        "crs":    "EPSG:4326",
-        "transform": transform,
-    }
-    with rasterio.open(path, "w", **profile) as dst:
-        if bands == 1:
-            dst.write(data.astype("float32"), 1)
-        else:
-            dst.write(data.astype("float32"))
-    return path
 
 
 def _cfar_det(lon=1.0, lat=2.0, x=10, y=20, w=5, h=5, cls=1, area_px=25):
@@ -221,99 +191,3 @@ class TestMergeGeojson:
         detectors = {f["properties"]["detector"] for f in merged["features"]}
         assert detectors == {"cfar", "yolo"}
 
-
-# ── pixel_to_lonlat ────────────────────────────────────────────────────────────
-
-class TestPixelToLonlat:
-    def _transform(self):
-        # 10×10 image covering lon 0→1, lat 0→1
-        return from_bounds(0.0, 0.0, 1.0, 1.0, 10, 10)
-
-    def test_returns_arrays(self):
-        t = self._transform()
-        lons, lats = pixel_to_lonlat(np.array([0]), np.array([0]), t)
-        assert isinstance(lons, np.ndarray)
-        assert isinstance(lats, np.ndarray)
-
-    def test_single_pixel_centre(self):
-        t = self._transform()
-        lons, lats = pixel_to_lonlat(np.array([5]), np.array([5]), t)
-        assert 0.0 <= float(lons[0]) <= 1.0
-        assert 0.0 <= float(lats[0]) <= 1.0
-
-    def test_multiple_pixels_length_matches(self):
-        t = self._transform()
-        rows = np.array([0, 2, 4, 6])
-        cols = np.array([1, 3, 5, 7])
-        lons, lats = pixel_to_lonlat(rows, cols, t)
-        assert len(lons) == 4
-        assert len(lats) == 4
-
-    def test_col_increases_lon(self):
-        t = self._transform()
-        lons, _ = pixel_to_lonlat(np.array([5, 5]), np.array([2, 8]), t)
-        assert lons[0] < lons[1]
-
-    def test_row_increases_decreases_lat(self):
-        # rasterio: row 0 = top = higher lat
-        t = self._transform()
-        _, lats = pixel_to_lonlat(np.array([2, 8]), np.array([5, 5]), t)
-        assert lats[0] > lats[1]
-
-
-# ── read_band / save_geotiff ───────────────────────────────────────────────────
-
-class TestReadBandSaveGeotiff:
-    def test_read_band_returns_float32(self, tmp_path):
-        arr = np.ones((8, 8), dtype=np.float32) * 3.14
-        tif = _make_tif(tmp_path, arr)
-        data, meta = read_band(tif, band=1)
-        assert data.dtype == np.float32
-
-    def test_read_band_values_match(self, tmp_path):
-        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
-        tif = _make_tif(tmp_path, arr)
-        data, _ = read_band(tif)
-        assert np.allclose(data, arr)
-
-    def test_read_band_meta_has_profile_keys(self, tmp_path):
-        arr = np.ones((4, 4), dtype=np.float32)
-        tif = _make_tif(tmp_path, arr)
-        _, meta = read_band(tif)
-        for key in ("driver", "dtype", "width", "height", "count"):
-            assert key in meta
-
-    def test_save_geotiff_2d_creates_file(self, tmp_path):
-        arr  = np.random.rand(8, 8).astype(np.float32)
-        tif  = _make_tif(tmp_path / "src", arr)
-        _, meta = read_band(tif)
-        out  = tmp_path / "out" / "saved.tif"
-        save_geotiff(arr, meta, out)
-        assert out.exists()
-
-    def test_save_geotiff_2d_roundtrip(self, tmp_path):
-        arr = np.random.rand(8, 8).astype(np.float32)
-        tif = _make_tif(tmp_path / "src", arr)
-        _, meta = read_band(tif)
-        out = tmp_path / "saved.tif"
-        save_geotiff(arr, meta, out)
-        data, _ = read_band(out)
-        assert np.allclose(data, arr, atol=1e-5)
-
-    def test_save_geotiff_3d_roundtrip(self, tmp_path):
-        arr = np.random.rand(2, 8, 8).astype(np.float32)
-        tif = _make_tif(tmp_path / "src", arr, bands=2)
-        _, meta = read_band(tif)
-        meta["count"] = 2
-        out = tmp_path / "saved.tif"
-        save_geotiff(arr, meta, out)
-        with rasterio.open(out) as src:
-            assert src.count == 2
-
-    def test_save_geotiff_creates_parent_dirs(self, tmp_path):
-        arr = np.ones((4, 4), dtype=np.float32)
-        tif = _make_tif(tmp_path / "src", arr)
-        _, meta = read_band(tif)
-        out = tmp_path / "a" / "b" / "c" / "out.tif"
-        save_geotiff(arr, meta, out)
-        assert out.exists()

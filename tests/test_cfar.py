@@ -103,6 +103,39 @@ class TestFilterDetections:
         boxes = filter_detections(mask, min_area_px=1, max_area_px=9999)
         assert len(boxes) == 2
 
+    def test_conf_none_without_linear_image(self):
+        mask  = self._make_mask([(64, 64)])
+        boxes = filter_detections(mask, min_area_px=1, max_area_px=9999)
+        assert all(b["conf"] is None for b in boxes)
+
+    def test_conf_positive_with_linear_image(self):
+        mask  = self._make_mask([(64, 64)])
+        linear = np.ones((128, 128), dtype=np.float32)
+        boxes  = filter_detections(mask, min_area_px=1, max_area_px=9999, linear_image=linear)
+        assert len(boxes) == 1
+        assert boxes[0]["conf"] is not None
+        assert boxes[0]["conf"] > 0
+
+    def test_bright_target_conf_above_dim_background(self):
+        # two blobs: one dim, one bright → bright blob conf > dim blob conf
+        mask   = np.zeros((64, 64), dtype=np.uint8)
+        mask[10:13, 10:13] = 1   # dim blob
+        mask[40:43, 40:43] = 1   # bright blob
+        linear = np.ones((64, 64), dtype=np.float32) * 0.1
+        linear[10:13, 10:13] = 1.0
+        linear[40:43, 40:43] = 100.0
+        boxes  = filter_detections(mask, min_area_px=1, max_area_px=9999, linear_image=linear)
+        confs  = {b["cx"]: b["conf"] for b in boxes}
+        # bright blob centroid is around col 41, dim around col 11
+        bright_conf = max(confs.values())
+        dim_conf    = min(confs.values())
+        assert bright_conf > dim_conf
+
+    def test_empty_mask_returns_empty(self):
+        mask  = np.zeros((64, 64), dtype=np.uint8)
+        boxes = filter_detections(mask, min_area_px=1, max_area_px=9999)
+        assert boxes == []
+
 
 # ── nms_detections ─────────────────────────────────────────────────────────────
 
