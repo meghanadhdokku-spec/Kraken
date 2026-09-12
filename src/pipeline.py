@@ -53,6 +53,7 @@ from src.download.sentinel_download import (
 )
 from src.preprocess.sar_preprocess import preprocess_scene
 from src.detect.cfar_detect import detect_scene as cfar_detect_scene
+from src.match.ais_match import run_ais_matching
 from src.utils.geo_utils import merge_geojson, detections_to_geojson, save_geojson
 
 
@@ -74,6 +75,8 @@ def run_pipeline(
     yolo_conf: float      = YOLO_CONF_THRESH,
     yolo_iou: float       = YOLO_IOU_THRESH,
     yolo_tile: int        = YOLO_IMG_SIZE,
+    ais_csv: Path | None  = None,
+    ais_radius_km: float  = 2.0,
     viz: bool             = False,
 ) -> list[dict]:
     """
@@ -162,6 +165,19 @@ def run_pipeline(
                 except Exception as exc:
                     print(f"[WARN] YOLO failed for {tif.name}: {exc}")
 
+        # ── AIS matching ───────────────────────────────────────────────────────
+        all_boxes = cfar_boxes + yolo_boxes
+        if all_boxes:
+            all_boxes = run_ais_matching(
+                all_boxes,
+                scene_path=tif,
+                radius_km=ais_radius_km,
+                ais_csv_path=ais_csv,
+            )
+            n_dark    = sum(1 for d in all_boxes if d.get("dark_vessel"))
+            n_matched = len(all_boxes) - n_dark
+            print(f"  AIS: {n_matched} matched  |  {n_dark} dark vessels")
+
         # ── combined GeoJSON when both detectors ran ───────────────────────────
         if detector == "both" and (cfar_boxes or yolo_boxes):
             cfar_fc = detections_to_geojson(cfar_boxes, stem, "cfar")
@@ -179,7 +195,6 @@ def run_pipeline(
                     yolo_boxes=yolo_boxes or None,
                     out_path=out_dir / f"{stem}_overview.png",
                 )
-                all_boxes = cfar_boxes + yolo_boxes
                 if all_boxes:
                     render_detection_grid(
                         tif,
@@ -221,6 +236,11 @@ def parse_args(argv=None):
     p.add_argument("--yolo-conf",        type=float, default=YOLO_CONF_THRESH)
     p.add_argument("--yolo-iou",         type=float, default=YOLO_IOU_THRESH)
     p.add_argument("--yolo-tile",        type=int,   default=YOLO_IMG_SIZE)
+    p.add_argument("--ais-csv",          type=Path,  default=None,
+                   help="Path to AIS CSV (lat,lon,mmsi,vessel_name,flag,timestamp). "
+                        "Omit to flag all detections as dark vessels.")
+    p.add_argument("--ais-radius",       type=float, default=2.0,
+                   help="Match radius in km for AIS cross-referencing")
     p.add_argument("--viz",              action="store_true",
                    help="Save scene overview and detection chip grid PNGs")
     return p.parse_args(argv)
@@ -246,6 +266,8 @@ def main(argv=None):
         yolo_conf       = args.yolo_conf,
         yolo_iou        = args.yolo_iou,
         yolo_tile       = args.yolo_tile,
+        ais_csv         = args.ais_csv,
+        ais_radius_km   = args.ais_radius,
         viz             = args.viz,
     )
 
