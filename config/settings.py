@@ -3,10 +3,46 @@ Central configuration for Kraken.
 All path, AOI, and model constants live here — import this everywhere else.
 """
 
+import subprocess
+import sys
 from pathlib import Path
-from dotenv import load_dotenv
 import os
 
+# ── auto-install missing dependencies ────────────────────────────────────────
+# Maps import name → pip install name (only differs where they don't match).
+_REQUIRED = {
+    "dotenv":       "python-dotenv",
+    "rasterio":     "rasterio",
+    "numpy":        "numpy",
+    "scipy":        "scipy",
+    "cv2":          "opencv-python",
+    "matplotlib":   "matplotlib",
+    "shapely":      "shapely",
+    "geopandas":    "geopandas",
+    "pyproj":       "pyproj",
+    "requests":     "requests",
+    "tqdm":         "tqdm",
+    "yaml":         "pyyaml",
+}
+
+def _ensure_deps() -> None:
+    missing = []
+    for import_name, pip_name in _REQUIRED.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pip_name)
+
+    if missing:
+        print(f"[SETUP] Installing {len(missing)} missing package(s): {', '.join(missing)}")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        )
+        print("[SETUP] Done — continuing.")
+
+_ensure_deps()
+
+from dotenv import load_dotenv
 load_dotenv()
 
 # ── Project root ──────────────────────────────────────────────────────────────
