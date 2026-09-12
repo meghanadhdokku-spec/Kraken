@@ -70,7 +70,8 @@ def _build_map(detections: list[dict], center_lat: float, center_lon: float) -> 
     m = folium.Map(
         location=[center_lat, center_lon],
         zoom_start=8,
-        tiles="CartoDB dark_matter",
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri",
         prefer_canvas=True,
     )
     for d in detections:
