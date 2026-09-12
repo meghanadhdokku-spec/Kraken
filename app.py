@@ -259,11 +259,13 @@ if "detections" not in st.session_state:
 if run_btn:
     scene_path = None
 
+    scene_name_hint = None  # original filename for timestamp extraction
     if scene_source == "Upload .tif" and uploaded_tif:
         tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
         tmp.write(uploaded_tif.read())
         tmp.flush()
         scene_path = Path(tmp.name)
+        scene_name_hint = Path(uploaded_tif.name)  # keep S1 naming for timestamp
         st.session_state.scene_name = uploaded_tif.name
     elif selected_scene_name:
         scene_path = PROCESSED_DIR / selected_scene_name
@@ -302,7 +304,7 @@ if run_btn:
     with st.spinner(f"Cross-referencing AIS ({ais_label})…"):
         detections = run_ais_matching(
             detections,
-            scene_path=scene_path,
+            scene_path=scene_name_hint or scene_path,  # use original name for timestamp
             radius_km=ais_radius,
             api_token=gfw_token,
             ais_csv_path=ais_csv_path,
