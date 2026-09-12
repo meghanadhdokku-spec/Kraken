@@ -175,12 +175,30 @@ def clip_to_bbox(
 ) -> tuple[np.ndarray, dict]:
     """
     Clip to (west, south, east, north) bounding box in the dataset's CRS.
+    Intersects bbox with actual scene extent before clipping so the window
+    is always valid even when bbox partially or fully falls outside the scene.
     Returns the clipped array and updated profile.
     """
     transform = meta["transform"]
     H, W = data.shape[-2], data.shape[-1]
 
-    window = window_from_bounds(*bbox, transform=transform).crop(H, W)
+    # Actual scene bounds
+    s_left, s_bottom, s_right, s_top = rasterio.transform.array_bounds(H, W, transform)
+
+    # Intersect with requested bbox
+    west  = max(bbox[0], s_left)
+    south = max(bbox[1], s_bottom)
+    east  = min(bbox[2], s_right)
+    north = min(bbox[3], s_top)
+
+    if west >= east or south >= north:
+        raise ValueError(
+            f"AOI bbox {bbox} does not intersect scene extent "
+            f"({s_left:.3f}, {s_bottom:.3f}, {s_right:.3f}, {s_top:.3f})"
+        )
+
+    effective_bbox = (west, south, east, north)
+    window = window_from_bounds(*effective_bbox, transform=transform).crop(H, W)
 
     col0 = int(window.col_off)
     row0 = int(window.row_off)
@@ -189,7 +207,7 @@ def clip_to_bbox(
 
     clipped = data[..., row0:row1, col0:col1]
     new_transform = rasterio.transform.from_bounds(
-        bbox[0], bbox[1], bbox[2], bbox[3],
+        west, south, east, north,
         clipped.shape[-1], clipped.shape[-2],
     )
     new_meta = meta.copy()
