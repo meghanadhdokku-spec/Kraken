@@ -23,6 +23,11 @@ Detections are post-processed with:
   • distance-based NMS             (merges nearby scatter clusters)
   • optional water mask            (suppresses land false alarms)
 
+Dual-band mode (default):
+  CFAR is run on both VV (band 1) and VH (band 2) independently.
+  The two binary masks are combined with logical OR before post-processing,
+  which catches targets detectable in either polarisation.
+
 Usage:
     python -m src.detect.cfar_detect \
         --scene data/processed/S1A_..._processed.tif
@@ -176,30 +181,34 @@ def filter_detections(
     """
     Convert binary mask → filtered bounding box list with confidence scores.
 
-    min_area_px  : drops noise specks
-    max_area_px  : drops land/coastline blobs (vessels are small targets)
-    linear_image : linear-scale σ⁰ array used to compute per-component
-                   confidence = component mean power / global detected mean power
+    min_area_px   : drops noise specks
+    max_area_px   : drops land/coastline blobs (vessels are small targets)
+    linear_image  : optional (H, W) linear-power array used to compute a
+                    per-detection confidence score.  When provided, each box
+                    gets a ``conf`` key equal to the mean linear power of the
+                    component's pixels divided by the global mean power of all
+                    detected pixels (proxy for the CFAR threshold ratio).
+                    Values > 1.0 indicate a target brighter than average.
+                    When not provided, ``conf`` is set to None.
     """
     import cv2
     labels, stats, centroids = connected_components(mask)
 
-    global_mean = float(np.mean(linear_image[mask > 0])) if (
-        linear_image is not None and mask.any()
-    ) else 1.0
+    # Global background reference: mean power over all detected pixels
+    if linear_image is not None:
+        global_mean_power = float(np.nanmean(linear_image[mask > 0])) if mask.any() else 1.0
+        if global_mean_power == 0.0:
+            global_mean_power = 1.0
+    else:
+        global_mean_power = None
 
     boxes = []
     for lbl in range(1, len(stats)):
         area = int(stats[lbl, cv2.CC_STAT_AREA])
         if area < min_area_px or area > max_area_px:
             continue
-        comp_mask = labels == lbl
-        if linear_image is not None:
-            comp_mean = float(np.mean(linear_image[comp_mask]))
-            conf = round(min(comp_mean / (global_mean + 1e-10), 1.0), 4)
-        else:
-            conf = None
-        box = {
+
+        box: dict = {
             "x":       int(stats[lbl, cv2.CC_STAT_LEFT]),
             "y":       int(stats[lbl, cv2.CC_STAT_TOP]),
             "w":       int(stats[lbl, cv2.CC_STAT_WIDTH]),
@@ -208,8 +217,14 @@ def filter_detections(
             "cy":      float(centroids[lbl, 1]),
             "area_px": area,
         }
-        if conf is not None:
-            box["conf"] = conf
+
+        if linear_image is not None:
+            component_pixels = linear_image[labels == lbl]
+            mean_component   = float(np.nanmean(component_pixels))
+            box["conf"]      = mean_component / global_mean_power
+        else:
+            box["conf"] = None
+
         boxes.append(box)
     return boxes
 
@@ -308,12 +323,13 @@ def save_detections_csv(boxes: list[dict], out_path: Path) -> None:
     fieldnames = [
         "lon", "lat", "cx_px", "cy_px",
         "x", "y", "w", "h", "area_px",
-        "length_m", "width_m", "vessel_class",
+        "conf", "length_m", "width_m", "vessel_class",
     ]
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for b in boxes:
+            conf_val = b.get("conf")
             writer.writerow({
                 "lon":          f"{b['lon']:.6f}",
                 "lat":          f"{b['lat']:.6f}",
@@ -324,6 +340,7 @@ def save_detections_csv(boxes: list[dict], out_path: Path) -> None:
                 "w":            b["w"],
                 "h":            b["h"],
                 "area_px":      b["area_px"],
+                "conf":         f"{conf_val:.4f}" if conf_val is not None else "",
                 "length_m":     b.get("length_m", ""),
                 "width_m":      b.get("width_m", ""),
                 "vessel_class": b.get("vessel_class", ""),
@@ -345,31 +362,63 @@ def detect_scene(
     land_mask_path: "Path | None" = None,
     nms_iou: float = 0.3,
     out_dir: Path = OUTPUTS_DIR,
+    dual_band: bool = True,
 ) -> list[dict]:
     """
     Full CFAR detection pipeline for one preprocessed GeoTIFF.
 
+    Parameters
+    ----------
+    dual_band : bool, default True
+        When True, run CA-CFAR on both VV (band 1) and VH (band 2) and
+        combine the binary masks with logical OR before post-processing.
+        This improves recall for targets that are only detectable in one
+        polarisation.  When False, only band ``band_index`` is processed
+        (original single-band behaviour).
+
     Returns a list of detection dicts with pixel + geo coordinates,
-    physical dimensions (length_m, width_m), and a vessel_class label.
+    physical dimensions (length_m, width_m), vessel_class, and conf score.
     """
-    print(f"\n[CFAR] {scene_path.name}  (band {band_index})")
+    if dual_band:
+        print(f"\n[CFAR] {scene_path.name}  (dual-band VV+VH)")
+    else:
+        print(f"\n[CFAR] {scene_path.name}  (band {band_index})")
 
     with rasterio.open(scene_path) as src:
-        data_db   = src.read(band_index).astype(np.float32)
+        if dual_band:
+            data_db_vv = src.read(1).astype(np.float32)
+            data_db_vh = src.read(2).astype(np.float32)
+        else:
+            data_db_vv = src.read(band_index).astype(np.float32)
+            data_db_vh = None
         transform = src.transform
         crs       = src.crs
 
     # Convert dB → linear power; fill NaN nodata with 0
-    linear = np.where(np.isnan(data_db), 0.0, 10.0 ** (data_db / 10.0))
+    linear = np.where(np.isnan(data_db_vv), 0.0, 10.0 ** (data_db_vv / 10.0))
 
-    raw_mask = cfar_detect(linear, guard, background, pfa)
-    print(f"  Raw detections (pixels): {int(raw_mask.sum())}")
+    if dual_band:
+        linear_vh = np.where(np.isnan(data_db_vh), 0.0, 10.0 ** (data_db_vh / 10.0))
+        mask_vv   = cfar_detect(linear,    guard, background, pfa)
+        mask_vh   = cfar_detect(linear_vh, guard, background, pfa)
+        raw_mask  = np.logical_or(mask_vv, mask_vh).astype(np.uint8)
+        print(f"  VV detections (pixels):  {int(mask_vv.sum())}")
+        print(f"  VH detections (pixels):  {int(mask_vh.sum())}")
+        print(f"  Combined OR mask:         {int(raw_mask.sum())}")
+    else:
+        raw_mask = cfar_detect(linear, guard, background, pfa)
+        print(f"  Raw detections (pixels): {int(raw_mask.sum())}")
 
     if use_land_mask:
         raw_mask = apply_land_mask(raw_mask, transform, crs, land_mask_path)
         print(f"  After land mask:         {int(raw_mask.sum())}")
 
+<<<<<<< HEAD
     boxes = filter_detections(raw_mask, min_area_px, max_area_px, linear_image=linear)
+=======
+    boxes = filter_detections(raw_mask, min_area_px, max_area_px,
+                              linear_image=linear)
+>>>>>>> origin/main
     print(f"  Connected components:     {len(boxes)}")
 
     boxes = nms_detections(boxes, nms_iou)
@@ -400,7 +449,7 @@ def parse_args(argv=None):
     )
     p.add_argument("--scene",        type=Path,  required=True)
     p.add_argument("--band",         type=int,   default=1,
-                   help="Band index (1=VV, 2=VH)")
+                   help="Band index used when --no-dual-band is set (1=VV, 2=VH)")
     p.add_argument("--guard",        type=int,   default=CFAR_GUARD_CELLS)
     p.add_argument("--background",   type=int,   default=CFAR_BACKGROUND_CELLS)
     p.add_argument("--pfa",          type=float, default=CFAR_FALSE_ALARM_RATE)
@@ -412,6 +461,8 @@ def parse_args(argv=None):
                    help="Path to a local land shapefile (default: Natural Earth built-in)")
     p.add_argument("--nms-iou",      type=float, default=0.3)
     p.add_argument("--out-dir",      type=Path,  default=OUTPUTS_DIR)
+    p.add_argument("--no-dual-band", action="store_true",
+                   help="Run CFAR on VV only instead of fusing VV+VH (dual-band is on by default)")
     return p.parse_args(argv)
 
 
@@ -429,13 +480,15 @@ def main(argv=None):
         land_mask_path = args.land_mask_path,
         nms_iou        = args.nms_iou,
         out_dir        = args.out_dir,
+        dual_band      = not args.no_dual_band,
     )
     if boxes:
-        print(f"\n{'LON':>10}  {'LAT':>9}  {'AREA_PX':>8}  {'LENGTH_M':>10}  {'CLASS'}")
-        print("-" * 60)
+        print(f"\n{'LON':>10}  {'LAT':>9}  {'AREA_PX':>8}  {'CONF':>6}  {'LENGTH_M':>10}  {'CLASS'}")
+        print("-" * 70)
         for b in boxes:
+            conf_str = f"{b['conf']:6.3f}" if b.get("conf") is not None else "   N/A"
             print(
-                f"  {b['lon']:8.4f}  {b['lat']:8.4f}  {b['area_px']:>8}"
+                f"  {b['lon']:8.4f}  {b['lat']:8.4f}  {b['area_px']:>8}  {conf_str}"
                 f"  {b.get('length_m', ''):>10}  {b.get('vessel_class', '')}"
             )
 
