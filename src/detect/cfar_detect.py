@@ -1,36 +1,45 @@
 """
-Cell-Averaging CFAR (CA-CFAR) vessel detector on SAR σ⁰ imagery.
+Cell-Averaging CFAR (CA-CFAR) vessel detector on Sentinel-1 SAR imagery.
 
-CA-CFAR slides a window over the image:
-  ┌─────────────────────────┐
-  │   Background cells      │
-  │   ┌───────────────┐     │
-  │   │  Guard cells  │     │
-  │   │  ┌─────────┐  │     │
-  │   │  │   CUT   │  │     │  CUT = Cell Under Test
-  │   │  └─────────┘  │     │
-  │   └───────────────┘     │
-  └─────────────────────────┘
+Window layout (half-widths in pixels):
+  ┌─────────────────────────────────┐
+  │        Background ring          │  ← half-width = guard + background
+  │   ┌─────────────────────────┐   │
+  │   │       Guard ring        │   │  ← half-width = guard
+  │   │   ┌─────────────────┐   │   │
+  │   │   │  Cell Under     │   │   │
+  │   │   │  Test (CUT)     │   │   │
+  │   │   └─────────────────┘   │   │
+  │   └─────────────────────────┘   │
+  └─────────────────────────────────┘
 
-A pixel is flagged when its value exceeds:
-    threshold = mean(background) + α
-where α is chosen to meet the target false alarm rate.
+Threshold:  T = α · mean(background)
+            α = N · (Pfa^(-1/N) − 1)   [Rayleigh clutter, linear power]
+
+A pixel is a detection when its linear power exceeds T.
+
+Detections are post-processed with:
+  • minimum / maximum area filter  (removes noise and land blobs)
+  • distance-based NMS             (merges nearby scatter clusters)
+  • optional water mask            (suppresses land false alarms)
 
 Usage:
-    python -m src.detect.cfar_detect --scene data/processed/scene.tif
+    python -m src.detect.cfar_detect \
+        --scene data/processed/S1A_..._processed.tif
 """
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
 import numpy as np
 import rasterio
+import rasterio.transform as rtransform
 from scipy.ndimage import uniform_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config.settings import (
-    PROCESSED_DIR,
     OUTPUTS_DIR,
     CFAR_GUARD_CELLS,
     CFAR_BACKGROUND_CELLS,
@@ -38,15 +47,18 @@ from config.settings import (
 )
 
 
-# ── CFAR core ──────────────────────────────────────────────────────────────────
+# ── threshold maths ────────────────────────────────────────────────────────────
 
-def _alpha_from_pfa(n_background: int, pfa: float) -> float:
+def _alpha(n_background: int, pfa: float) -> float:
     """
-    Closed-form α for CA-CFAR under Rayleigh clutter (linear scale).
-    α = n * (pfa^(-1/n) - 1)
+    CA-CFAR scaling factor for Rayleigh-distributed clutter (linear power).
+
+    Derived from Pfa = (1 + α/N)^{-N}  →  α = N·(Pfa^{-1/N} − 1).
     """
     return n_background * (pfa ** (-1.0 / n_background) - 1.0)
 
+
+# ── CFAR kernel ────────────────────────────────────────────────────────────────
 
 def cfar_detect(
     image: np.ndarray,
@@ -55,152 +67,270 @@ def cfar_detect(
     pfa: float = CFAR_FALSE_ALARM_RATE,
 ) -> np.ndarray:
     """
-    Apply 2-D CA-CFAR to a single-band image (rows, cols).
+    2-D CA-CFAR on a single-band image.
 
     Parameters
     ----------
-    image      : 2-D float32 array in linear (not dB) scale.
-    guard      : Guard cell half-width in pixels.
-    background : Background cell half-width in pixels (excludes guard zone).
+    image      : (H, W) float32, linear power scale (not dB).
+                 NaN / nodata should be set to 0 beforehand.
+    guard      : Guard-cell half-width in pixels.
+    background : Background-cell half-width (added outside guard zone).
     pfa        : Target probability of false alarm.
 
     Returns
     -------
-    Binary mask (uint8): 1 = detection, 0 = background.
+    Binary uint8 mask: 1 = detection, 0 = background.
     """
-    total_half  = guard + background
-    total_side  = 2 * total_half + 1
-    guard_side  = 2 * guard + 1
+    total_half = guard + background
+    total_side = 2 * total_half + 1
+    guard_side = 2 * guard + 1
 
-    # number of background cells
-    n_bg = total_side ** 2 - guard_side ** 2
-    alpha = _alpha_from_pfa(n_bg, pfa)
+    n_bg  = total_side ** 2 - guard_side ** 2
+    alpha = _alpha(n_bg, pfa)
 
-    # sum over total window and guard window via uniform_filter (fast)
+    # Efficient box-sum via uniform_filter (mean × size² = sum)
     total_sum = uniform_filter(image, size=total_side, mode="reflect") * total_side ** 2
     guard_sum = uniform_filter(image, size=guard_side,  mode="reflect") * guard_side ** 2
+    bg_mean   = (total_sum - guard_sum) / n_bg
 
-    bg_mean = (total_sum - guard_sum) / n_bg
-
-    threshold = bg_mean * (1.0 + alpha)
+    # Correct CA-CFAR threshold: T = α · bg_mean
+    threshold  = alpha * bg_mean
     detections = (image > threshold).astype(np.uint8)
     return detections
 
 
-def detections_to_bboxes(
+# ── post-processing ────────────────────────────────────────────────────────────
+
+def apply_water_mask(
+    image_db: np.ndarray,
     mask: np.ndarray,
-    min_area_px: int = 4,
-) -> list[dict]:
+    vv_db_threshold: float = -10.0,
+) -> np.ndarray:
     """
-    Convert a binary detection mask to bounding boxes using connected components.
+    Suppress detections on pixels whose VV σ⁰ is above a land-threshold.
 
-    Returns list of dicts with keys: x, y, w, h, cx, cy (pixel coords).
+    Open ocean typically returns −15 to −20 dB VV; land is ≫ −10 dB.
+    This is a coarse heuristic — pair with a proper land mask in production.
     """
+    land = image_db > vv_db_threshold
+    return np.where(land, 0, mask).astype(np.uint8)
+
+
+def connected_components(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Thin wrapper around cv2 connectedComponentsWithStats."""
     import cv2
-
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+    _, labels, stats, centroids = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
+    return labels, stats, centroids
+
+
+def _iou(a: dict, b: dict) -> float:
+    """Intersection-over-Union of two (x,y,w,h) boxes."""
+    ax1, ay1 = a["x"], a["y"]
+    ax2, ay2 = ax1 + a["w"], ay1 + a["h"]
+    bx1, by1 = b["x"], b["y"]
+    bx2, by2 = bx1 + b["w"], by1 + b["h"]
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union
+
+
+def nms_detections(boxes: list[dict], iou_threshold: float = 0.3) -> list[dict]:
+    """
+    Greedy IoU-based NMS.  Keeps the largest-area box when two overlap.
+    Also merges boxes whose centroids are within 2× the largest box diagonal.
+    """
+    if not boxes:
+        return []
+
+    sorted_boxes = sorted(boxes, key=lambda b: b["area_px"], reverse=True)
+    kept = []
+    suppressed = set()
+
+    for i, box in enumerate(sorted_boxes):
+        if i in suppressed:
+            continue
+        kept.append(box)
+        for j in range(i + 1, len(sorted_boxes)):
+            if j not in suppressed and _iou(box, sorted_boxes[j]) > iou_threshold:
+                suppressed.add(j)
+
+    return kept
+
+
+def filter_detections(
+    mask: np.ndarray,
+    min_area_px: int = 4,
+    max_area_px: int = 5000,
+) -> list[dict]:
+    """
+    Convert binary mask → filtered bounding box list.
+
+    min_area_px  : drops noise specks
+    max_area_px  : drops land/coastline blobs (vessels are small targets)
+    """
+    import cv2
+    labels, stats, centroids = connected_components(mask)
 
     boxes = []
-    for label in range(1, num_labels):  # skip background (label 0)
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area < min_area_px:
+    for lbl in range(1, len(stats)):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < min_area_px or area > max_area_px:
             continue
-        x  = int(stats[label, cv2.CC_STAT_LEFT])
-        y  = int(stats[label, cv2.CC_STAT_TOP])
-        w  = int(stats[label, cv2.CC_STAT_WIDTH])
-        h  = int(stats[label, cv2.CC_STAT_HEIGHT])
-        cx = float(centroids[label, 0])
-        cy = float(centroids[label, 1])
-        boxes.append({"x": x, "y": y, "w": w, "h": h, "cx": cx, "cy": cy, "area_px": area})
-
+        boxes.append({
+            "x":       int(stats[lbl, cv2.CC_STAT_LEFT]),
+            "y":       int(stats[lbl, cv2.CC_STAT_TOP]),
+            "w":       int(stats[lbl, cv2.CC_STAT_WIDTH]),
+            "h":       int(stats[lbl, cv2.CC_STAT_HEIGHT]),
+            "cx":      float(centroids[lbl, 0]),
+            "cy":      float(centroids[lbl, 1]),
+            "area_px": area,
+        })
     return boxes
 
 
-def pixel_to_geo(
-    boxes: list[dict],
-    transform,
-) -> list[dict]:
-    """Add lon/lat centroid to each bounding box using the rasterio transform."""
-    import rasterio.transform as rt
-
-    for box in boxes:
-        lon, lat = rt.xy(transform, box["cy"], box["cx"])
-        box["lon"] = lon
-        box["lat"] = lat
+def add_geo_coords(boxes: list[dict], transform) -> list[dict]:
+    """Add lon/lat centroid to each box dict."""
+    for b in boxes:
+        lon, lat = rtransform.xy(transform, b["cy"], b["cx"])
+        b["lon"] = float(lon)
+        b["lat"] = float(lat)
     return boxes
+
+
+# ── I/O ────────────────────────────────────────────────────────────────────────
+
+def save_mask(
+    mask: np.ndarray,
+    reference_path: Path,
+    out_path: Path,
+) -> None:
+    with rasterio.open(reference_path) as src:
+        profile = src.profile.copy()
+    profile.update(count=1, dtype="uint8", nodata=0)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(mask, 1)
+    print(f"[OK]   Mask      → {out_path}")
+
+
+def save_detections_csv(boxes: list[dict], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["lon", "lat", "cx_px", "cy_px", "x", "y", "w", "h", "area_px"]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for b in boxes:
+            writer.writerow({
+                "lon": f"{b['lon']:.6f}",
+                "lat": f"{b['lat']:.6f}",
+                "cx_px": f"{b['cx']:.1f}",
+                "cy_px": f"{b['cy']:.1f}",
+                "x": b["x"], "y": b["y"],
+                "w": b["w"], "h": b["h"],
+                "area_px": b["area_px"],
+            })
+    print(f"[OK]   CSV       → {out_path}")
 
 
 # ── pipeline ───────────────────────────────────────────────────────────────────
 
 def detect_scene(
     scene_path: Path,
-    band_index: int = 1,      # 1 = VV, 2 = VH
+    band_index: int = 1,
     guard: int = CFAR_GUARD_CELLS,
     background: int = CFAR_BACKGROUND_CELLS,
     pfa: float = CFAR_FALSE_ALARM_RATE,
     min_area_px: int = 4,
+    max_area_px: int = 5000,
+    use_water_mask: bool = True,
+    nms_iou: float = 0.3,
     out_dir: Path = OUTPUTS_DIR,
 ) -> list[dict]:
-    print(f"[INFO] Running CA-CFAR on {scene_path.name} (band {band_index}) …")
+    """
+    Full CFAR detection pipeline for one preprocessed GeoTIFF.
+
+    Returns a list of detection dicts with pixel + geo coordinates.
+    """
+    print(f"\n[CFAR] {scene_path.name}  (band {band_index})")
 
     with rasterio.open(scene_path) as src:
-        data = src.read(band_index).astype(np.float32)
+        data_db   = src.read(band_index).astype(np.float32)
         transform = src.transform
 
-    # dB → linear for CFAR statistics
-    linear = 10.0 ** (data / 10.0)
-    linear = np.nan_to_num(linear, nan=0.0)
+    # Convert dB → linear power; fill NaN nodata with 0
+    linear = np.where(np.isnan(data_db), 0.0, 10.0 ** (data_db / 10.0))
 
-    mask = cfar_detect(linear, guard, background, pfa)
-    boxes = detections_to_bboxes(mask, min_area_px)
-    boxes = pixel_to_geo(boxes, transform)
+    raw_mask = cfar_detect(linear, guard, background, pfa)
+    print(f"  Raw detections (pixels): {int(raw_mask.sum())}")
 
-    print(f"[INFO] {len(boxes)} detection(s) found.")
+    if use_water_mask:
+        raw_mask = apply_water_mask(data_db, raw_mask)
+        print(f"  After water mask:        {int(raw_mask.sum())}")
 
-    # save detection mask
+    boxes = filter_detections(raw_mask, min_area_px, max_area_px)
+    print(f"  Connected components:     {len(boxes)}")
+
+    boxes = nms_detections(boxes, nms_iou)
+    print(f"  After NMS:               {len(boxes)}")
+
+    boxes = add_geo_coords(boxes, transform)
+
+    # Save outputs
     out_dir.mkdir(parents=True, exist_ok=True)
-    mask_path = out_dir / f"{scene_path.stem}_cfar_mask.tif"
-    with rasterio.open(scene_path) as src:
-        profile = src.profile.copy()
-    profile.update(count=1, dtype="uint8", nodata=0)
-    with rasterio.open(mask_path, "w", **profile) as dst:
-        dst.write(mask, 1)
-    print(f"[OK]   Mask → {mask_path}")
+    stem = scene_path.stem
+    save_mask(raw_mask, scene_path, out_dir / f"{stem}_cfar_mask.tif")
+    save_detections_csv(boxes, out_dir / f"{stem}_cfar_detections.csv")
 
+    print(f"  Final vessel candidates: {len(boxes)}")
     return boxes
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="CA-CFAR vessel detector.")
-    parser.add_argument("--scene",      type=Path, required=True)
-    parser.add_argument("--band",       type=int,  default=1, help="Band index (1=VV, 2=VH)")
-    parser.add_argument("--guard",      type=int,  default=CFAR_GUARD_CELLS)
-    parser.add_argument("--background", type=int,  default=CFAR_BACKGROUND_CELLS)
-    parser.add_argument("--pfa",        type=float, default=CFAR_FALSE_ALARM_RATE)
-    parser.add_argument("--min-area",   type=int,  default=4)
-    parser.add_argument("--out-dir",    type=Path, default=OUTPUTS_DIR)
-    return parser.parse_args(argv)
+    p = argparse.ArgumentParser(
+        description="CA-CFAR vessel detector on SAR σ⁰ GeoTIFF.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--scene",        type=Path,  required=True)
+    p.add_argument("--band",         type=int,   default=1,
+                   help="Band index (1=VV, 2=VH)")
+    p.add_argument("--guard",        type=int,   default=CFAR_GUARD_CELLS)
+    p.add_argument("--background",   type=int,   default=CFAR_BACKGROUND_CELLS)
+    p.add_argument("--pfa",          type=float, default=CFAR_FALSE_ALARM_RATE)
+    p.add_argument("--min-area",     type=int,   default=4)
+    p.add_argument("--max-area",     type=int,   default=5000)
+    p.add_argument("--no-water-mask", action="store_true")
+    p.add_argument("--nms-iou",      type=float, default=0.3)
+    p.add_argument("--out-dir",      type=Path,  default=OUTPUTS_DIR)
+    return p.parse_args(argv)
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    args  = parse_args(argv)
     boxes = detect_scene(
-        args.scene,
-        band_index=args.band,
-        guard=args.guard,
-        background=args.background,
-        pfa=args.pfa,
-        min_area_px=args.min_area,
-        out_dir=args.out_dir,
+        scene_path     = args.scene,
+        band_index     = args.band,
+        guard          = args.guard,
+        background     = args.background,
+        pfa            = args.pfa,
+        min_area_px    = args.min_area,
+        max_area_px    = args.max_area,
+        use_water_mask = not args.no_water_mask,
+        nms_iou        = args.nms_iou,
+        out_dir        = args.out_dir,
     )
     if boxes:
-        print("\nDetections (lon, lat, area_px):")
+        print(f"\n{'LON':>10}  {'LAT':>9}  {'AREA_PX':>8}")
+        print("-" * 32)
         for b in boxes:
-            print(f"  ({b['lon']:.4f}, {b['lat']:.4f})  area={b['area_px']} px")
+            print(f"  {b['lon']:8.4f}  {b['lat']:8.4f}  {b['area_px']:>8}")
 
 
 if __name__ == "__main__":

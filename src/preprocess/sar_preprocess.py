@@ -1,156 +1,271 @@
 """
-SAR preprocessing pipeline.
+SAR preprocessing pipeline for Sentinel-1 GRD scenes.
 
-Steps applied per Sentinel-1 SAFE scene:
-  1. Read VV and VH bands from the SAFE zip (rasterio)
-  2. Convert DN → sigma-naught (linear, then dB)
-  3. Clip to AOI bounding box (optional)
-  4. Apply Lee speckle filter (7×7 kernel)
-  5. Write float32 GeoTIFF to processed/
+Steps applied per SAFE scene (zip or directory):
+  1. Locate VV + VH measurement GeoTIFFs inside the SAFE archive
+  2. Convert DN → σ⁰ linear → dB  (GRD calibration)
+  3. Reproject to EPSG:4326 if not already geographic
+  4. Clip to AOI bounding box (optional)
+  5. Apply Lee speckle filter
+  6. Write 2-band float32 GeoTIFF → data/processed/
 
 Usage:
-    python -m src.preprocess.sar_preprocess --scene data/raw/S1A_IW_GRD_...SAFE.zip
+    python -m src.preprocess.sar_preprocess \
+        --scene data/raw/S1A_IW_GRDH_1SDV_...SAFE.zip
 """
 
 import argparse
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import rasterio
+from rasterio.crs import CRS
 from rasterio.enums import Resampling
-from rasterio.windows import from_bounds
+from rasterio.warp import calculate_default_transform, reproject
+from rasterio.windows import from_bounds as window_from_bounds
 from scipy.ndimage import uniform_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config.settings import PROCESSED_DIR, GOG_BBOX
 
+TARGET_CRS = CRS.from_epsg(4326)
 
-# ── signal maths ───────────────────────────────────────────────────────────────
+
+# ── SAFE archive navigation ────────────────────────────────────────────────────
+
+def find_safe_measurements(safe_path: Path) -> dict[str, str]:
+    """
+    Locate VV and VH measurement GeoTIFFs inside a SAFE zip or directory.
+
+    Returns a dict like {'VV': '<rasterio-openable path>', 'VH': '...'}.
+    Paths for zip files use GDAL's /vsizip/ virtual filesystem.
+    Raises FileNotFoundError if both polarisations are not found.
+    """
+    pols: dict[str, str] = {}
+
+    if safe_path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(safe_path) as zf:
+            names = zf.namelist()
+        tiffs = [n for n in names if "/measurement/" in n and n.endswith(".tiff")]
+        for entry in tiffs:
+            lower = entry.lower()
+            if "-vv-" in lower:
+                pols["VV"] = f"/vsizip/{safe_path}/{entry}"
+            elif "-vh-" in lower:
+                pols["VH"] = f"/vsizip/{safe_path}/{entry}"
+    else:
+        # Unpacked .SAFE directory
+        meas_dir = safe_path / "measurement"
+        if not meas_dir.is_dir():
+            raise FileNotFoundError(f"No measurement/ directory in {safe_path}")
+        for tiff in meas_dir.glob("*.tiff"):
+            lower = tiff.name.lower()
+            if "-vv-" in lower:
+                pols["VV"] = str(tiff)
+            elif "-vh-" in lower:
+                pols["VH"] = str(tiff)
+
+    missing = [p for p in ("VV", "VH") if p not in pols]
+    if missing:
+        raise FileNotFoundError(
+            f"Could not find {missing} measurement tiffs in {safe_path}"
+        )
+    return pols
+
+
+# ── radiometric calibration ────────────────────────────────────────────────────
 
 def dn_to_sigma0_db(dn: np.ndarray, nodata: float = 0.0) -> np.ndarray:
-    """Convert GRD integer DN to σ⁰ in dB.  Nodata pixels become NaN."""
-    arr = dn.astype(np.float32)
-    valid = arr != nodata
-    sigma_linear = np.where(valid, arr ** 2, np.nan)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        sigma_db = 10.0 * np.log10(sigma_linear)
-    return sigma_db
+    """
+    GRD DN → σ⁰ in dB.
 
+    For Sentinel-1 GRD, σ⁰ (linear) = DN².
+    Nodata (DN == 0) → NaN.  Very small values → NaN to avoid -inf.
+    """
+    arr = dn.astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sigma_lin = np.where(arr > 0, arr ** 2, np.nan)
+        sigma_db  = 10.0 * np.log10(sigma_lin)
+    return sigma_db.astype(np.float32)
+
+
+# ── speckle filter ─────────────────────────────────────────────────────────────
 
 def lee_filter(img: np.ndarray, kernel_size: int = 7) -> np.ndarray:
     """
-    Single-look Lee speckle filter.
-    Works band-by-band on a (bands, rows, cols) or (rows, cols) array.
+    Single-look Lee speckle filter operating in dB domain.
+    Handles NaN (no-data) pixels by masking before filtering.
+    Works on (bands, H, W) or (H, W).
     """
     def _filter_2d(band: np.ndarray) -> np.ndarray:
-        mask = np.isnan(band)
-        band_filled = np.where(mask, 0.0, band)
-        mean  = uniform_filter(band_filled, kernel_size)
-        mean2 = uniform_filter(band_filled ** 2, kernel_size)
-        var   = mean2 - mean ** 2
-        noise_var = np.nanmean(var)
-        weight = var / (var + noise_var + 1e-10)
-        filtered = mean + weight * (band_filled - mean)
-        return np.where(mask, np.nan, filtered)
+        nan_mask   = np.isnan(band)
+        filled     = np.where(nan_mask, 0.0, band)
+        local_mean = uniform_filter(filled, kernel_size, mode="reflect")
+        local_sq   = uniform_filter(filled ** 2, kernel_size, mode="reflect")
+        local_var  = local_sq - local_mean ** 2
+        # estimate noise variance as the mean of local variances
+        noise_var  = float(np.nanmean(local_var))
+        weight     = local_var / (local_var + noise_var + 1e-10)
+        filtered   = local_mean + weight * (filled - local_mean)
+        return np.where(nan_mask, np.nan, filtered).astype(np.float32)
 
     if img.ndim == 2:
         return _filter_2d(img)
     return np.stack([_filter_2d(img[b]) for b in range(img.shape[0])])
 
 
-# ── I/O ────────────────────────────────────────────────────────────────────────
+# ── reprojection ───────────────────────────────────────────────────────────────
 
-def read_grd_bands(scene_path: Path) -> tuple[np.ndarray, dict]:
+def reproject_to_wgs84(
+    data: np.ndarray,
+    meta: dict,
+) -> tuple[np.ndarray, dict]:
     """
-    Open a Sentinel-1 GRD SAFE zip and read the VV + VH bands.
-
-    Returns:
-        data  – float32 ndarray (2, rows, cols) [VV, VH] in dB
-        meta  – rasterio profile dict
+    Reproject (bands, H, W) data to EPSG:4326 if it is not already geographic.
+    Returns reprojected data and updated profile.
     """
-    with rasterio.open(scene_path) as src:
-        if src.count < 2:
-            raise ValueError(f"Expected ≥2 bands in {scene_path}, got {src.count}")
-        vv = src.read(1)
-        vh = src.read(2)
-        meta = src.profile.copy()
+    src_crs = meta.get("crs")
+    if src_crs and CRS(src_crs) == TARGET_CRS:
+        return data, meta
 
-    vv_db = dn_to_sigma0_db(vv)
-    vh_db = dn_to_sigma0_db(vh)
+    n_bands, src_h, src_w = data.shape
+    src_transform = meta["transform"]
 
-    data = np.stack([vv_db, vh_db], axis=0)
-    meta.update(count=2, dtype="float32", nodata=np.nan)
-    return data, meta
+    dst_transform, dst_w, dst_h = calculate_default_transform(
+        src_crs, TARGET_CRS, src_w, src_h, transform=src_transform
+    )
 
+    out = np.full((n_bands, dst_h, dst_w), np.nan, dtype=np.float32)
+
+    for b in range(n_bands):
+        reproject(
+            source=data[b],
+            destination=out[b],
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=TARGET_CRS,
+            resampling=Resampling.bilinear,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+        )
+
+    new_meta = meta.copy()
+    new_meta.update(
+        crs=TARGET_CRS,
+        transform=dst_transform,
+        width=dst_w,
+        height=dst_h,
+    )
+    return out, new_meta
+
+
+# ── AOI clipping ───────────────────────────────────────────────────────────────
 
 def clip_to_bbox(
     data: np.ndarray,
     meta: dict,
     bbox: tuple[float, float, float, float],
 ) -> tuple[np.ndarray, dict]:
-    """Clip raster to a (west, south, east, north) bounding box."""
-    from rasterio.transform import array_bounds
-    from rasterio.windows import from_bounds as fb
-
+    """
+    Clip to (west, south, east, north) bounding box in the dataset's CRS.
+    Returns the clipped array and updated profile.
+    """
     transform = meta["transform"]
-    crs       = meta["crs"]
-    height, width = data.shape[-2], data.shape[-1]
+    H, W = data.shape[-2], data.shape[-1]
 
-    window = fb(bbox[0], bbox[1], bbox[2], bbox[3], transform=transform)
-    window = window.crop(height, width)
+    window = window_from_bounds(*bbox, transform=transform).crop(H, W)
 
-    col_off = int(window.col_off)
-    row_off = int(window.row_off)
-    col_end = col_off + int(window.width)
-    row_end = row_off + int(window.height)
+    col0 = int(window.col_off)
+    row0 = int(window.row_off)
+    col1 = col0 + int(window.width)
+    row1 = row0 + int(window.height)
 
-    clipped = data[..., row_off:row_end, col_off:col_end]
+    clipped = data[..., row0:row1, col0:col1]
     new_transform = rasterio.transform.from_bounds(
         bbox[0], bbox[1], bbox[2], bbox[3],
         clipped.shape[-1], clipped.shape[-2],
     )
-    meta = meta.copy()
-    meta.update(
+    new_meta = meta.copy()
+    new_meta.update(
         width=clipped.shape[-1],
         height=clipped.shape[-2],
         transform=new_transform,
     )
-    return clipped, meta
+    return clipped, new_meta
+
+
+# ── I/O ────────────────────────────────────────────────────────────────────────
+
+def read_grd_bands(safe_path: Path) -> tuple[np.ndarray, dict]:
+    """
+    Open VV and VH polarisation bands from a Sentinel-1 GRD SAFE archive.
+
+    Returns:
+        data – float32 (2, H, W) array: band 1 = VV dB, band 2 = VH dB
+        meta – rasterio profile (from the VV tiff, updated for 2 bands)
+    """
+    pols = find_safe_measurements(safe_path)
+
+    bands = []
+    meta  = None
+    for pol in ("VV", "VH"):
+        with rasterio.open(pols[pol]) as src:
+            dn = src.read(1)
+            if meta is None:
+                meta = src.profile.copy()
+        bands.append(dn_to_sigma0_db(dn))
+
+    data = np.stack(bands, axis=0)  # (2, H, W)
+    meta.update(count=2, dtype="float32", nodata=float("nan"))
+    return data, meta
 
 
 def write_geotiff(data: np.ndarray, meta: dict, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(out_path, "w", **meta) as dst:
-        if data.ndim == 2:
+    if data.ndim == 2:
+        meta = {**meta, "count": 1}
+        with rasterio.open(out_path, "w", **meta) as dst:
             dst.write(data, 1)
-        else:
-            for b in range(data.shape[0]):
-                dst.write(data[b], b + 1)
+    else:
+        with rasterio.open(out_path, "w", **meta) as dst:
+            dst.write(data)
     print(f"[OK]   Written → {out_path}")
 
 
-# ── pipeline ───────────────────────────────────────────────────────────────────
+# ── full pipeline ──────────────────────────────────────────────────────────────
 
 def preprocess_scene(
     scene_path: Path,
     out_dir: Path = PROCESSED_DIR,
     clip_bbox: tuple | None = GOG_BBOX,
     speckle_kernel: int = 7,
+    reproject: bool = True,
 ) -> Path:
-    print(f"[INFO] Preprocessing {scene_path.name} …")
+    """
+    Full preprocessing pipeline for one Sentinel-1 GRD SAFE scene.
+
+    Returns path to the output GeoTIFF.
+    """
+    print(f"\n[PREPROCESS] {scene_path.name}")
 
     data, meta = read_grd_bands(scene_path)
-    print(f"  Bands: VV + VH  |  Shape: {data.shape}")
+    print(f"  Read VV+VH  shape={data.shape}  crs={meta.get('crs')}")
+
+    if reproject:
+        data, meta = reproject_to_wgs84(data, meta)
+        print(f"  Reprojected → EPSG:4326  shape={data.shape}")
 
     if clip_bbox:
         data, meta = clip_to_bbox(data, meta, clip_bbox)
-        print(f"  Clipped to bbox: {data.shape}")
+        print(f"  Clipped to AOI  shape={data.shape}")
 
-    data = lee_filter(data, kernel_size=speckle_kernel)
-    print(f"  Speckle-filtered (kernel={speckle_kernel})")
+    data = lee_filter(data, speckle_kernel)
+    print(f"  Lee filter (kernel={speckle_kernel}) applied")
 
-    stem = scene_path.stem.split(".")[0]
+    stem     = scene_path.stem.split(".")[0]
     out_path = out_dir / f"{stem}_processed.tif"
     write_geotiff(data, meta, out_path)
     return out_path
@@ -159,18 +274,26 @@ def preprocess_scene(
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Preprocess a Sentinel-1 GRD scene.")
-    parser.add_argument("--scene", type=Path, required=True, help="Path to SAFE zip or .tif")
-    parser.add_argument("--out-dir", type=Path, default=PROCESSED_DIR)
-    parser.add_argument("--no-clip", action="store_true", help="Skip AOI clipping")
-    parser.add_argument("--kernel", type=int, default=7, help="Lee filter kernel size")
-    return parser.parse_args(argv)
+    p = argparse.ArgumentParser(
+        description="Preprocess a Sentinel-1 GRD scene.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--scene",    type=Path, required=True,
+                   help="SAFE zip, SAFE directory, or pre-calibrated GeoTIFF")
+    p.add_argument("--out-dir",  type=Path, default=PROCESSED_DIR)
+    p.add_argument("--no-clip",  action="store_true", help="Skip AOI clip")
+    p.add_argument("--no-reproject", action="store_true", help="Skip reprojection")
+    p.add_argument("--kernel",   type=int, default=7, help="Lee filter kernel size")
+    return p.parse_args(argv)
 
 
 def main(argv=None):
-    args = parse_args(argv)
-    clip = None if args.no_clip else GOG_BBOX
-    preprocess_scene(args.scene, args.out_dir, clip, args.kernel)
+    args  = parse_args(argv)
+    clip  = None if args.no_clip else GOG_BBOX
+    preprocess_scene(
+        args.scene, args.out_dir, clip,
+        args.kernel, reproject=not args.no_reproject,
+    )
 
 
 if __name__ == "__main__":
