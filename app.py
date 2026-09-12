@@ -22,7 +22,7 @@ for _key in ("COPERNICUS_USER", "COPERNICUS_PASSWORD", "GFW_API_TOKEN"):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.detect.cfar_detect import detect_scene
 from src.match.ais_match import run_ais_matching
-from config.settings import PROCESSED_DIR, OUTPUTS_DIR, CFAR_FALSE_ALARM_RATE, AIS_DIR
+from config.settings import PROCESSED_DIR, OUTPUTS_DIR, CFAR_FALSE_ALARM_RATE, AIS_DIR, GFW_API_TOKEN
 
 # ── page config ────────────────────────────────────────────────────────────────
 
@@ -85,14 +85,13 @@ def _build_map(detections: list[dict], center_lat: float, center_lon: float) -> 
         if lat is None or lon is None:
             continue
         dark     = d.get("dark_vessel", True)
-        matched  = d.get("ais_match")
         color    = "#FF4444" if dark else "#22C55E"
         v_class  = d.get("vessel_class", "unknown")
         conf     = d.get("conf")
         conf_str = f"{conf:.2f}" if conf is not None else "n/a"
         length   = d.get("length_m", 0)
-        mmsi     = matched.get("mmsi", "—") if matched else "—"
-        name     = matched.get("vessel_name", "—") if matched else "—"
+        mmsi     = d.get("matched_vessel_id") or "—"
+        name     = d.get("matched_vessel_name") or "—"
 
         popup_html = f"""
         <div style='font-family:monospace;font-size:12px;min-width:180px'>
@@ -125,7 +124,6 @@ def _build_map(detections: list[dict], center_lat: float, center_lon: float) -> 
 def _detections_to_df(detections: list[dict]) -> pd.DataFrame:
     rows = []
     for d in detections:
-        matched = d.get("ais_match") or {}
         rows.append({
             "lat":          round(d.get("lat", 0), 5),
             "lon":          round(d.get("lon", 0), 5),
@@ -134,9 +132,9 @@ def _detections_to_df(detections: list[dict]) -> pd.DataFrame:
             "width_m":      round(d.get("width_m", 0), 1),
             "conf":         round(d.get("conf") or 0, 3),
             "dark_vessel":  d.get("dark_vessel", True),
-            "mmsi":         matched.get("mmsi", ""),
-            "vessel_name":  matched.get("vessel_name", ""),
-            "flag":         matched.get("flag", ""),
+            "mmsi":         d.get("matched_vessel_id") or "",
+            "vessel_name":  d.get("matched_vessel_name") or "",
+            "flag":         d.get("matched_flag") or "",
         })
     return pd.DataFrame(rows)
 
@@ -229,6 +227,13 @@ with st.sidebar:
 
     ais_radius = st.slider("Match radius (km)", 0.5, 10.0, 2.0, 0.5)
 
+    if GFW_API_TOKEN and ais_source == "Local file (data/ais/)" and not local_ais:
+        st.success("🛰 GFW live API active")
+    elif GFW_API_TOKEN and not ais_file and not selected_ais_name:
+        st.success("🛰 GFW live API active")
+    elif not GFW_API_TOKEN and not ais_file and not selected_ais_name:
+        st.caption("No AIS source — all detections will be dark.")
+
     st.divider()
 
     run_btn = st.button("▶  Run Detection", type="primary", use_container_width=True)
@@ -286,11 +291,17 @@ if run_btn:
             st.error(f"Detection failed: {e}")
             st.stop()
 
-    with st.spinner("Cross-referencing AIS…"):
+    gfw_token = GFW_API_TOKEN or None
+    ais_label = (
+        "GFW live API" if (gfw_token and not ais_csv_path)
+        else (ais_csv_path.name if ais_csv_path else "none — all vessels dark")
+    )
+    with st.spinner(f"Cross-referencing AIS ({ais_label})…"):
         detections = run_ais_matching(
             detections,
             scene_path=scene_path,
             radius_km=ais_radius,
+            api_token=gfw_token,
             ais_csv_path=ais_csv_path,
         )
 
