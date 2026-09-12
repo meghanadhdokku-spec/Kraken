@@ -19,6 +19,7 @@ _REQUIRED = {
     "matplotlib":   "matplotlib",
     "shapely":      "shapely",
     "geopandas":    "geopandas",
+    "geodatasets":  "geodatasets",
     "pyproj":       "pyproj",
     "requests":     "requests",
     "tqdm":         "tqdm",
