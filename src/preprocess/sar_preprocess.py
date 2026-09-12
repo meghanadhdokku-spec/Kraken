@@ -103,8 +103,7 @@ def lee_filter(img: np.ndarray, kernel_size: int = 7) -> np.ndarray:
         filled     = np.where(nan_mask, 0.0, band)
         local_mean = uniform_filter(filled, kernel_size, mode="reflect")
         local_sq   = uniform_filter(filled ** 2, kernel_size, mode="reflect")
-        local_var  = local_sq - local_mean ** 2
-        # estimate noise variance as the mean of local variances
+        local_var  = np.maximum(local_sq - local_mean ** 2, 0.0)
         noise_var  = float(np.nanmean(local_var))
         weight     = local_var / (local_var + noise_var + 1e-10)
         filtered   = local_mean + weight * (filled - local_mean)

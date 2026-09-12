@@ -148,10 +148,7 @@ def _iou(a: dict, b: dict) -> float:
 
 
 def nms_detections(boxes: list[dict], iou_threshold: float = 0.3) -> list[dict]:
-    """
-    Greedy IoU-based NMS.  Keeps the largest-area box when two overlap.
-    Also merges boxes whose centroids are within 2× the largest box diagonal.
-    """
+    """Greedy IoU-based NMS. Keeps the largest-area box when two overlap."""
     if not boxes:
         return []
 
@@ -174,22 +171,35 @@ def filter_detections(
     mask: np.ndarray,
     min_area_px: int = 4,
     max_area_px: int = 5000,
+    linear_image: np.ndarray | None = None,
 ) -> list[dict]:
     """
-    Convert binary mask → filtered bounding box list.
+    Convert binary mask → filtered bounding box list with confidence scores.
 
     min_area_px  : drops noise specks
     max_area_px  : drops land/coastline blobs (vessels are small targets)
+    linear_image : linear-scale σ⁰ array used to compute per-component
+                   confidence = component mean power / global detected mean power
     """
     import cv2
     labels, stats, centroids = connected_components(mask)
+
+    global_mean = float(np.mean(linear_image[mask > 0])) if (
+        linear_image is not None and mask.any()
+    ) else 1.0
 
     boxes = []
     for lbl in range(1, len(stats)):
         area = int(stats[lbl, cv2.CC_STAT_AREA])
         if area < min_area_px or area > max_area_px:
             continue
-        boxes.append({
+        comp_mask = labels == lbl
+        if linear_image is not None:
+            comp_mean = float(np.mean(linear_image[comp_mask]))
+            conf = round(min(comp_mean / (global_mean + 1e-10), 1.0), 4)
+        else:
+            conf = None
+        box = {
             "x":       int(stats[lbl, cv2.CC_STAT_LEFT]),
             "y":       int(stats[lbl, cv2.CC_STAT_TOP]),
             "w":       int(stats[lbl, cv2.CC_STAT_WIDTH]),
@@ -197,7 +207,10 @@ def filter_detections(
             "cx":      float(centroids[lbl, 0]),
             "cy":      float(centroids[lbl, 1]),
             "area_px": area,
-        })
+        }
+        if conf is not None:
+            box["conf"] = conf
+        boxes.append(box)
     return boxes
 
 
@@ -356,7 +369,7 @@ def detect_scene(
         raw_mask = apply_land_mask(raw_mask, transform, crs, land_mask_path)
         print(f"  After land mask:         {int(raw_mask.sum())}")
 
-    boxes = filter_detections(raw_mask, min_area_px, max_area_px)
+    boxes = filter_detections(raw_mask, min_area_px, max_area_px, linear_image=linear)
     print(f"  Connected components:     {len(boxes)}")
 
     boxes = nms_detections(boxes, nms_iou)

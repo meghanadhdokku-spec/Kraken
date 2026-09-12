@@ -34,6 +34,9 @@ from config.settings import (
     PROCESSED_DIR,
     OUTPUTS_DIR,
     GOG_BBOX,
+    GOG_WKT,
+    COPERNICUS_USER,
+    COPERNICUS_PASSWORD,
     CFAR_GUARD_CELLS,
     CFAR_BACKGROUND_CELLS,
     CFAR_FALSE_ALARM_RATE,
@@ -42,14 +45,11 @@ from config.settings import (
     YOLO_IMG_SIZE,
 )
 from src.download.sentinel_download import (
-    build_api,
+    get_access_token,
     query_scenes,
     download_scenes,
     _default_dates,
     _bbox_to_wkt,
-    COPERNICUS_USER,
-    COPERNICUS_PASSWORD,
-    SENTINEL_API_URL,
 )
 from src.preprocess.sar_preprocess import preprocess_scene
 from src.detect.cfar_detect import detect_scene as cfar_detect_scene
@@ -88,8 +88,6 @@ def run_pipeline(
             raw_scenes = sorted(RAW_DIR.glob("*.zip")) + sorted(RAW_DIR.glob("*.SAFE"))
         else:
             raw_scenes = [scene] if scene.suffix.lower() in (".zip", "") else []
-            if not raw_scenes:
-                raw_scenes = []
     else:
         if not COPERNICUS_USER or not COPERNICUS_PASSWORD:
             sys.exit(
@@ -100,18 +98,10 @@ def run_pipeline(
         default_start, default_end = _default_dates()
         date_start = start or default_start
         date_end   = end   or default_end
-        footprint  = _bbox_to_wkt(*bbox) if bbox else (
-            f"POLYGON(("
-            f"{GOG_BBOX[0]} {GOG_BBOX[1]}, "
-            f"{GOG_BBOX[2]} {GOG_BBOX[1]}, "
-            f"{GOG_BBOX[2]} {GOG_BBOX[3]}, "
-            f"{GOG_BBOX[0]} {GOG_BBOX[3]}, "
-            f"{GOG_BBOX[0]} {GOG_BBOX[1]}"
-            f"))"
-        )
-        api      = build_api(COPERNICUS_USER, COPERNICUS_PASSWORD, SENTINEL_API_URL)
-        products = query_scenes(api, footprint, date_start, date_end, limit)
-        raw_scenes = download_scenes(api, products, RAW_DIR)
+        footprint  = _bbox_to_wkt(*bbox) if bbox else GOG_WKT
+        token      = get_access_token(COPERNICUS_USER, COPERNICUS_PASSWORD)
+        products   = query_scenes(footprint, date_start, date_end, limit)
+        raw_scenes = download_scenes(products, RAW_DIR, token)
 
     if not raw_scenes and not skip_preprocess:
         print("[WARN] No scenes to process.")
