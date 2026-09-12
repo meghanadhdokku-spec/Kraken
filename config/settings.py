@@ -64,9 +64,20 @@ CFAR_FALSE_ALARM_RATE = 1e-6
 
 # ── YOLOv8 ───────────────────────────────────────────────────────────────────
 YOLO_MODEL_SIZE   = "n"          # nano — swap for s/m/l/x
-YOLO_IMG_SIZE     = 640
+YOLO_IMG_SIZE     = 800          # matches native xView3 chip size
 YOLO_EPOCHS       = 50
 YOLO_BATCH        = 16
 YOLO_CONF_THRESH  = 0.25
 YOLO_IOU_THRESH   = 0.45
 YOLO_PRETRAINED   = f"yolov8{YOLO_MODEL_SIZE}.pt"
+
+# ── xView3 dataset ────────────────────────────────────────────────────────────
+XVIEW3_DIR        = ANNOTATIONS_DIR / "xview3"
+XVIEW3_CHIP_SIZE  = 800          # native chip size (px); chips are square
+
+# Class mapping — matches src/train/xview3_prep.py CLASS_MAP
+XVIEW3_CLASS_NAMES = ["non_vessel", "vessel", "fishing_vessel"]
+
+# xView3 confidence tiers to include in training labels
+# "HIGH" only = cleanest labels; add "MEDIUM" for more data
+XVIEW3_MIN_CONFIDENCE = "LOW"    # include all: HIGH, MEDIUM, LOW
