@@ -279,7 +279,7 @@ def match_detections_to_ais(
 # Sentinel-1 filename pattern:
 # S1A_IW_GRDH_1SDV_20230412T060000_20230412T060030_...
 _S1_TS_RE = re.compile(
-    r"S1[AB]_\w+_\w+_\w+_"
+    r"S1[A-Z]_\w+_\w+_\w+_"
     r"(?P<start>\d{8}T\d{6})_"
     r"(?P<stop>\d{8}T\d{6})_"
 )

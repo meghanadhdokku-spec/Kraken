@@ -301,10 +301,20 @@ if run_btn:
         "GFW live API" if (gfw_token and not ais_csv_path)
         else (ais_csv_path.name if ais_csv_path else "none — all vessels dark")
     )
+
+    # Show what time window will be queried so user can verify
+    if gfw_token and not ais_csv_path:
+        from src.match.ais_match import _parse_scene_times
+        try:
+            t0, t1 = _parse_scene_times(scene_name_hint or scene_path)
+            st.info(f"🛰 GFW query window: `{t0}` → `{t1}`")
+        except ValueError:
+            st.warning("⚠ Could not parse scene acquisition time from filename — GFW will query current time window.")
+
     with st.spinner(f"Cross-referencing AIS ({ais_label})…"):
         detections = run_ais_matching(
             detections,
-            scene_path=scene_name_hint or scene_path,  # use original name for timestamp
+            scene_path=scene_name_hint or scene_path,
             radius_km=ais_radius,
             api_token=gfw_token,
             ais_csv_path=ais_csv_path,
