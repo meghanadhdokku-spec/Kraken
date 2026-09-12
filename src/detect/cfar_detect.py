@@ -102,33 +102,23 @@ def cfar_detect(
 
 # ── post-processing ────────────────────────────────────────────────────────────
 
-def apply_water_mask(
-    image_db: np.ndarray,
+def apply_land_mask(
     mask: np.ndarray,
-    vv_db_threshold: float = -5.0,
-    min_land_area_px: int = 200,
+    transform,
+    crs,
+    land_shp_path: "Path | None" = None,
 ) -> np.ndarray:
     """
-    Suppress detections that sit inside extended bright blobs (land/coast).
+    Zero CFAR detections that fall on land using Natural Earth polygons.
 
-    Strategy: pixels above vv_db_threshold are candidate land. Connected
-    regions of those pixels that are large (≥ min_land_area_px) are treated
-    as land and used to zero CFAR detections. Small bright blobs are left
-    alone so vessel point-targets (which are also bright but compact) survive.
-
-    Typical SAR σ⁰:
-      Open ocean   : −15 to −20 dB
-      Vessels      : −5  to +15 dB  (small, isolated bright target)
-      Land/coast   : −5  to +20 dB  (spatially extended)
+    Rasterizes land polygons onto the scene grid so that compact bright
+    targets (vessels) are preserved regardless of their backscatter level,
+    while extended land and coastal clutter is suppressed.
     """
-    import cv2
-    bright = (image_db > vv_db_threshold).astype(np.uint8)
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
-    land_mask = np.zeros_like(bright)
-    for lbl in range(1, len(stats)):
-        if stats[lbl, cv2.CC_STAT_AREA] >= min_land_area_px:
-            land_mask[labels == lbl] = 1
-    return np.where(land_mask, 0, mask).astype(np.uint8)
+    from src.utils.geo_utils import build_land_mask
+    H, W = mask.shape
+    land = build_land_mask(transform, H, W, crs, land_shp_path)
+    return np.where(land, 0, mask).astype(np.uint8)
 
 
 def connected_components(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -263,7 +253,8 @@ def detect_scene(
     pfa: float = CFAR_FALSE_ALARM_RATE,
     min_area_px: int = 4,
     max_area_px: int = 5000,
-    use_water_mask: bool = True,
+    use_land_mask: bool = True,
+    land_mask_path: "Path | None" = None,
     nms_iou: float = 0.3,
     out_dir: Path = OUTPUTS_DIR,
 ) -> list[dict]:
@@ -277,6 +268,7 @@ def detect_scene(
     with rasterio.open(scene_path) as src:
         data_db   = src.read(band_index).astype(np.float32)
         transform = src.transform
+        crs       = src.crs
 
     # Convert dB → linear power; fill NaN nodata with 0
     linear = np.where(np.isnan(data_db), 0.0, 10.0 ** (data_db / 10.0))
@@ -284,9 +276,9 @@ def detect_scene(
     raw_mask = cfar_detect(linear, guard, background, pfa)
     print(f"  Raw detections (pixels): {int(raw_mask.sum())}")
 
-    if use_water_mask:
-        raw_mask = apply_water_mask(data_db, raw_mask)
-        print(f"  After water mask:        {int(raw_mask.sum())}")
+    if use_land_mask:
+        raw_mask = apply_land_mask(raw_mask, transform, crs, land_mask_path)
+        print(f"  After land mask:         {int(raw_mask.sum())}")
 
     boxes = filter_detections(raw_mask, min_area_px, max_area_px)
     print(f"  Connected components:     {len(boxes)}")
@@ -324,7 +316,10 @@ def parse_args(argv=None):
     p.add_argument("--pfa",          type=float, default=CFAR_FALSE_ALARM_RATE)
     p.add_argument("--min-area",     type=int,   default=4)
     p.add_argument("--max-area",     type=int,   default=5000)
-    p.add_argument("--no-water-mask", action="store_true")
+    p.add_argument("--no-land-mask",   action="store_true",
+                   help="Skip shapefile land mask (keep all detections)")
+    p.add_argument("--land-mask-path", type=Path, default=None,
+                   help="Path to a local land shapefile (default: Natural Earth built-in)")
     p.add_argument("--nms-iou",      type=float, default=0.3)
     p.add_argument("--out-dir",      type=Path,  default=OUTPUTS_DIR)
     return p.parse_args(argv)
@@ -340,7 +335,8 @@ def main(argv=None):
         pfa            = args.pfa,
         min_area_px    = args.min_area,
         max_area_px    = args.max_area,
-        use_water_mask = not args.no_water_mask,
+        use_land_mask  = not args.no_land_mask,
+        land_mask_path = args.land_mask_path,
         nms_iou        = args.nms_iou,
         out_dir        = args.out_dir,
     )

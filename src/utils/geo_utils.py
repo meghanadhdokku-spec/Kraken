@@ -1,6 +1,7 @@
 """Rasterio / geospatial helpers shared across modules."""
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -107,3 +108,94 @@ def merge_geojson(*collections: dict) -> dict:
     for fc in collections:
         features.extend(fc.get("features", []))
     return {"type": "FeatureCollection", "features": features}
+
+
+# ── land mask ─────────────────────────────────────────────────────────────────
+
+def _load_natural_earth_land():
+    """
+    Load Natural Earth land polygons, trying geopandas built-in then geodatasets.
+    Returns a GeoDataFrame with a single dissolved land geometry in EPSG:4326.
+    """
+    import geopandas as gpd
+
+    # geopandas < 1.0 ships 'naturalearth_lowres' as a bundled shapefile.
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            path = gpd.datasets.get_path("naturalearth_lowres")
+        gdf = gpd.read_file(path)
+        gdf = gdf[gdf.geometry.notnull()].copy()
+        gdf["_land"] = 1
+        return gdf.dissolve(by="_land")[["geometry"]]
+    except Exception:
+        pass
+
+    # geopandas >= 1.0 removed bundled datasets; geodatasets is the companion.
+    try:
+        import geodatasets
+        return gpd.read_file(geodatasets.get_path("naturalearth.land"))
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Cannot load Natural Earth land polygons.\n"
+        "Install geodatasets:  pip install geodatasets\n"
+        "Or pass --land-mask-path /path/to/ne_10m_land.shp"
+    )
+
+
+def build_land_mask(
+    transform,
+    height: int,
+    width: int,
+    crs,
+    land_shp_path: "Path | None" = None,
+) -> np.ndarray:
+    """
+    Rasterize Natural Earth land polygons onto the scene pixel grid.
+
+    Parameters
+    ----------
+    transform     : Affine transform of the scene (north-up expected).
+    height, width : Scene pixel dimensions.
+    crs           : Scene CRS (rasterio.crs.CRS or anything rasterio accepts).
+    land_shp_path : Optional path to a local shapefile; defaults to the
+                    Natural Earth bundled dataset.
+
+    Returns
+    -------
+    uint8 mask — 1 = land, 0 = ocean.
+    """
+    import geopandas as gpd
+    from rasterio.crs import CRS as RioCRS
+    from rasterio.features import rasterize
+
+    if land_shp_path is not None:
+        land = gpd.read_file(str(land_shp_path))
+    else:
+        land = _load_natural_earth_land()
+
+    scene_crs = crs if isinstance(crs, RioCRS) else RioCRS(crs)
+
+    # Reproject land polygons to scene CRS when needed
+    if land.crs is None or land.crs.to_epsg() != scene_crs.to_epsg():
+        land = land.to_crs(scene_crs)
+
+    shapes = [
+        (geom, 1)
+        for geom in land.geometry
+        if geom is not None and not geom.is_empty
+    ]
+
+    if not shapes:
+        return np.zeros((height, width), dtype=np.uint8)
+
+    return rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+        all_touched=False,
+    )
