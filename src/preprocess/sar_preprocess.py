@@ -206,6 +206,11 @@ def read_grd_bands(safe_path: Path) -> tuple[np.ndarray, dict]:
     Returns:
         data – float32 (2, H, W) array: band 1 = VV dB, band 2 = VH dB
         meta – rasterio profile (from the VV tiff, updated for 2 bands)
+
+    Sentinel-1 GRD measurement TIFFs embed no CRS; their geolocation is
+    stored as GCPs (Ground Control Points). When crs is None we derive an
+    approximate affine transform and assign EPSG:4326 from those GCPs so
+    the downstream reprojection step gets valid bounds.
     """
     pols = find_safe_measurements(safe_path)
 
@@ -216,6 +221,18 @@ def read_grd_bands(safe_path: Path) -> tuple[np.ndarray, dict]:
             dn = src.read(1)
             if meta is None:
                 meta = src.profile.copy()
+                # Raw Sentinel-1 GRD TIFFs have crs=None; derive from GCPs
+                if meta.get("crs") is None:
+                    gcps, gcp_crs = src.gcps
+                    if gcps:
+                        from rasterio.transform import from_gcps
+                        meta["crs"]       = gcp_crs if gcp_crs else TARGET_CRS
+                        meta["transform"] = from_gcps(gcps)
+                    else:
+                        raise ValueError(
+                            f"No CRS and no GCPs found in {pols[pol]}. "
+                            "Cannot determine scene geolocation."
+                        )
         bands.append(dn_to_sigma0_db(dn))
 
     data = np.stack(bands, axis=0)  # (2, H, W)
