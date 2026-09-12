@@ -1,2 +1,2 @@
-# Kraken
-Sentinel-1 SAR vessel detection pipeline for IUU fishing identification in Gulf of Guinea
+# Kraken v0 — SAR Vessel Detection
+Sentinel-1 GRD ship detector for IUU fishing enforcement. Gulf of Guinea beachhead.
