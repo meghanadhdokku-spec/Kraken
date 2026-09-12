@@ -24,7 +24,6 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.warp import calculate_default_transform, reproject
-from rasterio.windows import from_bounds as window_from_bounds
 from scipy.ndimage import uniform_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -182,28 +181,40 @@ def clip_to_bbox(
     transform = meta["transform"]
     H, W = data.shape[-2], data.shape[-1]
 
-    # Actual scene bounds
-    s_left, s_bottom, s_right, s_top = rasterio.transform.array_bounds(H, W, transform)
+    # array_bounds returns (west, south, east, north) but for south-up rasters
+    # (transform.e > 0, common with GCP-derived Sentinel-1 TIFFs) the second and
+    # fourth values are swapped geographically. Normalise before intersecting.
+    raw = rasterio.transform.array_bounds(H, W, transform)
+    s_left  = min(raw[0], raw[2])
+    s_right = max(raw[0], raw[2])
+    s_south = min(raw[1], raw[3])
+    s_north = max(raw[1], raw[3])
 
     # Intersect with requested bbox
     west  = max(bbox[0], s_left)
-    south = max(bbox[1], s_bottom)
+    south = max(bbox[1], s_south)
     east  = min(bbox[2], s_right)
-    north = min(bbox[3], s_top)
+    north = min(bbox[3], s_north)
 
     if west >= east or south >= north:
         raise ValueError(
             f"AOI bbox {bbox} does not intersect scene extent "
-            f"({s_left:.3f}, {s_bottom:.3f}, {s_right:.3f}, {s_top:.3f})"
+            f"({s_left:.3f}, {s_south:.3f}, {s_right:.3f}, {s_north:.3f})"
         )
 
-    effective_bbox = (west, south, east, north)
-    window = window_from_bounds(*effective_bbox, transform=transform).crop(H, W)
+    # Use inverse transform to map bbox corners → pixel coords.
+    # window_from_bounds rejects transforms with e > 0 (south-up), which
+    # GCP-derived transforms from raw Sentinel-1 TIFFs often produce.
+    inv = ~transform
+    corners_geo = [(west, north), (east, north), (east, south), (west, south)]
+    corners_px  = [inv * pt for pt in corners_geo]
+    col_vals = [c[0] for c in corners_px]
+    row_vals = [c[1] for c in corners_px]
 
-    col0 = int(window.col_off)
-    row0 = int(window.row_off)
-    col1 = col0 + int(window.width)
-    row1 = row0 + int(window.height)
+    col0 = max(0, int(np.floor(min(col_vals))))
+    row0 = max(0, int(np.floor(min(row_vals))))
+    col1 = min(W, int(np.ceil(max(col_vals))))
+    row1 = min(H, int(np.ceil(max(row_vals))))
 
     clipped = data[..., row0:row1, col0:col1]
     new_transform = rasterio.transform.from_bounds(
